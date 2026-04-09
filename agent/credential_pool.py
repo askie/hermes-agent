@@ -20,6 +20,7 @@ from hermes_cli.auth import (
     DEFAULT_AGENT_KEY_MIN_TTL_SECONDS,
     KIMI_CODE_BASE_URL,
     PROVIDER_REGISTRY,
+    _auth_store_lock,
     _codex_access_token_is_expiring,
     _decode_jwt_claims,
     _import_codex_cli_tokens,
@@ -27,6 +28,8 @@ from hermes_cli.auth import (
     _load_provider_state,
     _resolve_kimi_base_url,
     _resolve_zai_base_url,
+    _save_auth_store,
+    _save_provider_state,
     read_credential_pool,
     write_credential_pool,
 )
@@ -479,6 +482,50 @@ class CredentialPool:
             logger.debug("Failed to sync from ~/.codex/auth.json: %s", exc)
         return entry
 
+    def _sync_nous_entry_to_auth_store(self, entry: PooledCredential) -> None:
+        """Write refreshed Nous pool entry tokens back to auth.json providers.nous.
+
+        After a pool-level refresh/mint, the pool entry has fresh tokens but
+        auth.json's ``providers.nous`` still holds the pre-refresh state.
+        On the next ``load_pool("nous")``, ``_seed_from_singletons()`` reads
+        that stale state and can overwrite the fresh pool entry — potentially
+        re-seeding a consumed single-use refresh token.
+
+        This method syncs the updated tokens back to the auth store singleton
+        so both storage locations stay consistent.
+        """
+        if self.provider != "nous" or entry.source != "device_code":
+            return
+        try:
+            with _auth_store_lock():
+                auth_store = _load_auth_store()
+                state = _load_provider_state(auth_store, "nous")
+                if state is None:
+                    return
+                # Sync the key fields that refresh/mint can update
+                state["access_token"] = entry.access_token
+                if entry.refresh_token:
+                    state["refresh_token"] = entry.refresh_token
+                if entry.expires_at:
+                    state["expires_at"] = entry.expires_at
+                if entry.agent_key:
+                    state["agent_key"] = entry.agent_key
+                if entry.agent_key_expires_at:
+                    state["agent_key_expires_at"] = entry.agent_key_expires_at
+                # Sync extra fields that refresh_nous_oauth_pure may update
+                for extra_key in ("obtained_at", "expires_in", "agent_key_id",
+                                  "agent_key_expires_in", "agent_key_reused",
+                                  "agent_key_obtained_at"):
+                    val = entry.extra.get(extra_key)
+                    if val is not None:
+                        state[extra_key] = val
+                if entry.inference_base_url:
+                    state["inference_base_url"] = entry.inference_base_url
+                _save_provider_state(auth_store, "nous", state)
+                _save_auth_store(auth_store)
+        except Exception as exc:
+            logger.debug("Failed to sync Nous pool entry back to auth store: %s", exc)
+
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
@@ -612,6 +659,11 @@ class CredentialPool:
         )
         self._replace_entry(entry, updated)
         self._persist()
+        # Sync refreshed Nous tokens back to auth.json providers.nous so that
+        # _seed_from_singletons() on the next load_pool() sees fresh state
+        # instead of re-seeding stale/consumed tokens.
+        if self.provider == "nous":
+            self._sync_nous_entry_to_auth_store(updated)
         return updated
 
     def _entry_needs_refresh(self, entry: PooledCredential) -> bool:
