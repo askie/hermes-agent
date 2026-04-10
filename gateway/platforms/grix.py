@@ -15,11 +15,13 @@ from gateway.platforms.grix_protocol import (
     GrixConnectionConfig,
     GrixEditEvent,
     GrixInboundMessage,
+    GrixLocalAction,
     GrixRevokeEvent,
     GrixStopEvent,
     build_connection_config,
     normalize_edit_event,
     normalize_inbound_message,
+    normalize_local_action,
     normalize_revoke_event,
     normalize_stop_event,
 )
@@ -37,6 +39,8 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 MAX_TEXT_LENGTH = 4000
+_EXEC_APPROVAL_HOST = "Hermes Grix"
+_EXEC_APPROVAL_TIMEOUT_SEC = 300
 _ROUTE_SESSION_KEY_PREFIX = "agent:main:grix:"
 _STRIP_MARKDOWN_REPLACEMENTS = (
     (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),
@@ -60,6 +64,63 @@ def _strip_markdown(text: str) -> str:
         cleaned = pattern.sub(replacement, cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def _approval_lookup_id(params: Dict[str, Any]) -> str:
+    for key in ("approval_id", "approval_command_id", "exec_context_id"):
+        value = str(params.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _approval_choice_from_action(action_type: str, params: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    normalized_action = str(action_type or "").strip()
+    decision = str(params.get("decision") or "").strip()
+    if normalized_action == "exec_reject":
+        return "deny", "deny"
+    if normalized_action != "exec_approve":
+        return None, None
+
+    if decision == "allow-once":
+        return "once", decision
+    if decision == "allow-always":
+        return "always", decision
+    if decision == "deny":
+        return "deny", decision
+    return None, decision or None
+
+
+def _build_exec_approval_lines(command: str) -> list[str]:
+    normalized = str(command or "").replace("\r\n", "\n").strip()
+    if "\n" not in normalized:
+        return [f"Command: {normalized}"]
+
+    return [
+        "Command:",
+        "```",
+        *normalized.split("\n"),
+        "```",
+    ]
+
+
+def _build_exec_approval_text(
+    approval_id: str,
+    command: str,
+    description: str,
+    timeout_sec: int,
+) -> str:
+    lines = [
+        "🔒 Exec approval required",
+        f"ID: {approval_id}",
+        *_build_exec_approval_lines(command),
+        f"Host: {_EXEC_APPROVAL_HOST}",
+        f"Expires in: {max(timeout_sec, 1)}s",
+    ]
+    normalized_description = str(description or "").strip()
+    if normalized_description:
+        lines.append(f"Reason: {normalized_description}")
+    return "\n".join(lines)
 
 
 def build_grix_connection_config(config: PlatformConfig) -> GrixConnectionConfig:
@@ -236,6 +297,7 @@ class GrixAdapter(BasePlatformAdapter):
         self._latest_sources: Dict[str, Any] = {}
         self._message_sources: Dict[tuple[str, str], Any] = {}
         self._message_session_keys: Dict[tuple[str, str], str] = {}
+        self._approval_state: Dict[str, Dict[str, Optional[str]]] = {}
 
     def format_message(self, content: str) -> str:
         return _strip_markdown(content)
@@ -363,6 +425,62 @@ class GrixAdapter(BasePlatformAdapter):
                 retryable=_coerce_retryable(exc),
             )
 
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+        approval_id: Optional[str] = None,
+    ) -> SendResult:
+        if not self._client:
+            return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
+
+        resolved_approval_id = str(approval_id or "").strip()
+        if not resolved_approval_id:
+            resolved_approval_id = f"ga_{abs(hash((session_key, command))) & 0xFFFFFFFF:08x}"
+
+        source_hint = self._latest_sources.get(str(chat_id))
+        session_id, thread_id = await resolve_grix_target(
+            self._client,
+            self.connection,
+            str(chat_id),
+            thread_id=self._metadata_thread_id(metadata),
+            source_hint=source_hint,
+        )
+        text = _build_exec_approval_text(
+            approval_id=resolved_approval_id,
+            command=command[:3000] + "..." if len(command) > 3000 else command,
+            description=description,
+            timeout_sec=_EXEC_APPROVAL_TIMEOUT_SEC,
+        )
+
+        try:
+            receipt = await self._client.send_text(
+                str(session_id),
+                text,
+                thread_id=thread_id,
+            )
+            self._approval_state[resolved_approval_id] = {
+                "session_key": str(session_key).strip(),
+                "chat_id": str(chat_id).strip(),
+                "thread_id": thread_id,
+            }
+            return SendResult(
+                success=bool(receipt.get("ok")),
+                message_id=receipt.get("message_id"),
+                raw_response=receipt,
+                retryable=False,
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+                raw_response=exc,
+                retryable=_coerce_retryable(exc),
+            )
+
     async def edit_message(
         self,
         chat_id: str,
@@ -464,6 +582,8 @@ class GrixAdapter(BasePlatformAdapter):
         try:
             if cmd == "event_msg":
                 await self._handle_message_packet(payload)
+            elif cmd == "local_action":
+                await self._handle_local_action_packet(payload)
             elif cmd == "event_stop":
                 await self._handle_stop_packet(payload)
             elif cmd == "event_edit":
@@ -474,6 +594,73 @@ class GrixAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Ignoring unknown GRIX packet %s", self.name, cmd)
         except Exception as exc:
             logger.error("[%s] Failed handling GRIX packet %s: %s", self.name, cmd, exc, exc_info=True)
+
+    async def _handle_local_action_packet(self, payload: Dict[str, Any]) -> None:
+        if not self._client:
+            return
+
+        action: GrixLocalAction = normalize_local_action(payload)
+        if not action.action_id or not action.action_type:
+            await self._client.send_local_action_result(
+                action_id=action.action_id or "unknown",
+                status="failed",
+                error_code="invalid_local_action",
+                error_message="missing action_id or action_type",
+            )
+            return
+
+        if action.action_type not in {"exec_approve", "exec_reject"}:
+            await self._client.send_local_action_result(
+                action_id=action.action_id,
+                status="unsupported",
+                error_code="unsupported_local_action",
+                error_message=f"unsupported local action: {action.action_type}",
+            )
+            return
+
+        approval_id = _approval_lookup_id(action.params)
+        if not approval_id:
+            await self._client.send_local_action_result(
+                action_id=action.action_id,
+                status="failed",
+                error_code="missing_approval_id",
+                error_message="approval_id is required",
+            )
+            return
+
+        approval_choice, decision_value = _approval_choice_from_action(action.action_type, action.params)
+        if approval_choice is None:
+            await self._client.send_local_action_result(
+                action_id=action.action_id,
+                status="failed",
+                error_code="unsupported_decision",
+                error_message=f"unsupported approval decision: {decision_value or action.action_type}",
+            )
+            return
+
+        from tools.approval import resolve_gateway_approval_by_id
+
+        session_key = resolve_gateway_approval_by_id(approval_id, approval_choice)
+        approval_state = self._approval_state.pop(approval_id, None)
+        if session_key is None:
+            await self._client.send_local_action_result(
+                action_id=action.action_id,
+                status="failed",
+                error_code="approval_not_found",
+                error_message="unknown or expired approval id",
+            )
+            return
+
+        if approval_state:
+            paused_chat_id = str(approval_state.get("chat_id") or "").strip()
+            if paused_chat_id:
+                self.resume_typing_for_chat(paused_chat_id)
+
+        await self._client.send_local_action_result(
+            action_id=action.action_id,
+            status="ok",
+            result=decision_value or approval_choice,
+        )
 
     async def _handle_message_packet(self, payload: Dict[str, Any]) -> None:
         message = normalize_inbound_message(payload)

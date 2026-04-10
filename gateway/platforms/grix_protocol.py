@@ -15,10 +15,16 @@ DEFAULT_CLIENT_TYPE = "hermes"
 DEFAULT_CLIENT_VERSION = "0.8.0"
 DEFAULT_HOST_TYPE = "hermes"
 DEFAULT_CONTRACT_VERSION = 1
+REQUIRED_AUTH_CAPABILITIES = ("local_action_v1",)
 STABLE_AUTH_CAPABILITIES = (
     "session_route",
     "thread_v1",
     "inbound_media_v1",
+    "local_action_v1",
+)
+STABLE_LOCAL_ACTIONS = (
+    "exec_approve",
+    "exec_reject",
 )
 
 
@@ -42,7 +48,7 @@ def normalize_id(value: Any) -> str:
     return ""
 
 
-def normalize_capabilities(values: Optional[Iterable[Any]] = None) -> List[str]:
+def normalize_names(values: Optional[Iterable[Any]] = None) -> List[str]:
     seen = set()
     normalized: List[str] = []
     for raw_value in values or ():
@@ -52,6 +58,22 @@ def normalize_capabilities(values: Optional[Iterable[Any]] = None) -> List[str]:
         seen.add(value)
         normalized.append(value)
     return normalized
+
+
+def normalize_capabilities(values: Optional[Iterable[Any]] = None) -> List[str]:
+    return normalize_names(values)
+
+
+def _ensure_names(values: List[str], required: Iterable[str]) -> List[str]:
+    ensured = list(values)
+    seen = set(values)
+    for raw_name in required:
+        name = normalize_text(raw_name)
+        if not name or name in seen:
+            continue
+        ensured.append(name)
+        seen.add(name)
+    return ensured
 
 
 @dataclass(frozen=True)
@@ -67,6 +89,7 @@ class GrixConnectionConfig:
     host_version: Optional[str] = None
     contract_version: int = DEFAULT_CONTRACT_VERSION
     capabilities: List[str] | tuple[str, ...] = tuple(STABLE_AUTH_CAPABILITIES)
+    local_actions: List[str] | tuple[str, ...] = tuple(STABLE_LOCAL_ACTIONS)
     connect_timeout_ms: int = DEFAULT_CONNECT_TIMEOUT_MS
     request_timeout_ms: int = DEFAULT_REQUEST_TIMEOUT_MS
 
@@ -76,9 +99,21 @@ def build_connection_config(extra: Dict[str, Any], api_key: Optional[str]) -> Gr
     if isinstance(raw_capabilities, str):
         raw_capabilities = [entry.strip() for entry in raw_capabilities.split(",")]
 
+    raw_local_actions = extra.get("local_actions")
+    if isinstance(raw_local_actions, str):
+        raw_local_actions = [entry.strip() for entry in raw_local_actions.split(",")]
+
     capabilities = normalize_capabilities(raw_capabilities)
     if not capabilities:
         capabilities = list(STABLE_AUTH_CAPABILITIES)
+    else:
+        capabilities = _ensure_names(capabilities, REQUIRED_AUTH_CAPABILITIES)
+
+    local_actions = normalize_names(raw_local_actions)
+    if not local_actions:
+        local_actions = list(STABLE_LOCAL_ACTIONS)
+    else:
+        local_actions = _ensure_names(local_actions, STABLE_LOCAL_ACTIONS)
 
     return GrixConnectionConfig(
         endpoint=normalize_text(extra.get("endpoint")),
@@ -97,6 +132,7 @@ def build_connection_config(extra: Dict[str, Any], api_key: Optional[str]) -> Gr
             999_999,
         ),
         capabilities=capabilities,
+        local_actions=local_actions,
         connect_timeout_ms=clamp_int(
             extra.get("connect_timeout_ms"),
             DEFAULT_CONNECT_TIMEOUT_MS,
@@ -183,7 +219,28 @@ class GrixEditEvent:
     raw: Dict[str, Any] = None
 
 
+@dataclass(frozen=True)
+class GrixLocalAction:
+    action_id: str
+    action_type: str
+    params: Dict[str, Any]
+    event_id: Optional[str] = None
+    timeout_ms: int = 0
+    raw: Dict[str, Any] = None
+
+
 def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
+    capabilities = normalize_capabilities(config.capabilities)
+    local_actions = normalize_names(config.local_actions)
+    if capabilities:
+        capabilities = _ensure_names(capabilities, REQUIRED_AUTH_CAPABILITIES)
+    else:
+        capabilities = list(STABLE_AUTH_CAPABILITIES)
+    if local_actions:
+        local_actions = _ensure_names(local_actions, STABLE_LOCAL_ACTIONS)
+    else:
+        local_actions = list(STABLE_LOCAL_ACTIONS)
+
     payload: Dict[str, Any] = {
         "agent_id": config.agent_id,
         "api_key": config.api_key,
@@ -193,7 +250,8 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
         "protocol_version": PROTOCOL_VERSION,
         "contract_version": config.contract_version,
         "host_type": config.host_type,
-        "capabilities": normalize_capabilities(config.capabilities),
+        "capabilities": capabilities,
+        "local_actions": local_actions,
     }
     if config.host_version:
         payload["host_version"] = config.host_version
@@ -255,6 +313,22 @@ def resolve_chat_type(payload: Dict[str, Any]) -> str:
     if session_type == 2 or event_type.startswith("group_"):
         return "group"
     return "dm"
+
+
+def normalize_local_action(payload: Dict[str, Any]) -> GrixLocalAction:
+    action_id = normalize_text(payload.get("action_id"))
+    action_type = normalize_text(payload.get("action_type"))
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    return GrixLocalAction(
+        action_id=action_id,
+        action_type=action_type,
+        params=params,
+        event_id=normalize_text(payload.get("event_id")) or None,
+        timeout_ms=clamp_int(payload.get("timeout_ms"), 0, 0, 2**31 - 1),
+        raw=payload,
+    )
 
 
 def resolve_sender_name(payload: Dict[str, Any], sender_id: str) -> str:

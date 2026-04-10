@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import patch
 
 import pytest
 
@@ -84,6 +85,7 @@ class FakeProtocolClient:
         self.completed_events = []
         self.acknowledged_stops = []
         self.completed_stops = []
+        self.local_action_results = []
         self.sent = []
         self.edits = []
         self.activities = []
@@ -129,6 +131,9 @@ class FakeProtocolClient:
 
     async def set_session_activity(self, **kwargs):
         self.activities.append(kwargs)
+
+    async def send_local_action_result(self, **kwargs):
+        self.local_action_results.append(kwargs)
 
 
 class TestGrixConfig:
@@ -197,6 +202,13 @@ class TestGrixTooling:
         assert built.agent_id == "9001"
         assert built.api_key == "secret"
         assert built.account_id == "main"
+        assert "local_action_v1" in built.capabilities
+        assert built.local_actions == ["exec_approve", "exec_reject"]
+
+    def test_build_auth_payload_includes_local_actions(self):
+        payload = build_auth_payload(_transport_config())
+        assert "local_action_v1" in payload["capabilities"]
+        assert payload["local_actions"] == ["exec_approve", "exec_reject"]
 
 
 class TestGrixTransport:
@@ -461,6 +473,151 @@ class TestGrixAdapter:
         assert fake_client.resolved_routes[0]["route_session_key"] == session_key
         assert fake_client.sent[0]["session_id"] == "g_2002"
         assert fake_client.sent[0]["thread_id"] == "topic-a"
+
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_emits_backend_compatible_prompt(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        result = await adapter.send_exec_approval(
+            chat_id="g_1001",
+            command="rm -rf /tmp/demo",
+            session_key="agent:main:grix:group:g_1001:topic-a",
+            description="dangerous deletion",
+            approval_id="req_123",
+        )
+
+        assert result.success is True
+        assert "req_123" in adapter._approval_state
+        sent_text = fake_client.sent[0]["text"]
+        assert sent_text.startswith("🔒 Exec approval required")
+        assert "ID: req_123" in sent_text
+        assert "Command: rm -rf /tmp/demo" in sent_text
+        assert "Host: Hermes Grix" in sent_text
+        assert "Expires in: 300s" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_local_action_approve_resolves_specific_approval(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+        adapter._approval_state["req_123"] = {
+            "session_key": "agent:main:grix:group:g_1001:topic-a",
+            "chat_id": "g_1001",
+            "thread_id": "topic-a",
+        }
+        adapter.pause_typing_for_chat("g_1001")
+
+        with patch("tools.approval.resolve_gateway_approval_by_id", return_value="agent:main:grix:group:g_1001:topic-a") as mock_resolve:
+            await adapter._handle_protocol_packet(
+                {
+                    "cmd": "local_action",
+                    "seq": 0,
+                    "payload": {
+                        "action_id": "act-1",
+                        "action_type": "exec_approve",
+                        "params": {
+                            "approval_id": "req_123",
+                            "decision": "allow-once",
+                        },
+                    },
+                }
+            )
+
+        mock_resolve.assert_called_once_with("req_123", "once")
+        assert fake_client.local_action_results == [
+            {"action_id": "act-1", "status": "ok", "result": "allow-once"}
+        ]
+        assert "g_1001" not in adapter._typing_paused
+        assert "req_123" not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_local_action_reports_stale_approval(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+        adapter._approval_state["req_404"] = {
+            "session_key": "agent:main:grix:group:g_1001:topic-a",
+            "chat_id": "g_1001",
+            "thread_id": None,
+        }
+
+        with patch("tools.approval.resolve_gateway_approval_by_id", return_value=None):
+            await adapter._handle_protocol_packet(
+                {
+                    "cmd": "local_action",
+                    "seq": 0,
+                    "payload": {
+                        "action_id": "act-404",
+                        "action_type": "exec_approve",
+                        "params": {
+                            "approval_id": "req_404",
+                            "decision": "allow-once",
+                        },
+                    },
+                }
+            )
+
+        assert fake_client.local_action_results == [
+            {
+                "action_id": "act-404",
+                "status": "failed",
+                "error_code": "approval_not_found",
+                "error_message": "unknown or expired approval id",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_local_action_reports_unsupported_action(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        await adapter._handle_protocol_packet(
+            {
+                "cmd": "local_action",
+                "seq": 0,
+                "payload": {
+                    "action_id": "act-unsupported",
+                    "action_type": "open_url",
+                    "params": {},
+                },
+            }
+        )
+
+        assert fake_client.local_action_results == [
+            {
+                "action_id": "act-unsupported",
+                "status": "unsupported",
+                "error_code": "unsupported_local_action",
+                "error_message": "unsupported local action: open_url",
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_event_edit_updates_pending_message(self):
