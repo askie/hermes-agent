@@ -72,7 +72,18 @@ def _coerce_retryable(error: Exception) -> bool:
     lowered = str(error).lower()
     return any(
         token in lowered
-        for token in ("connect", "connection", "network", "timeout", "temporarily unavailable")
+        for token in (
+            "connect",
+            "connection",
+            "network",
+            "timeout",
+            "temporarily unavailable",
+            "closing transport",
+            "not connected",
+            "not authenticated",
+            "broken pipe",
+            "reset by peer",
+        )
     )
 
 
@@ -653,11 +664,20 @@ class GrixAdapter(BasePlatformAdapter):
     ) -> None:
         if not self._client or not event_id or event_id in self._completed_event_ids:
             return
-        await self._client.complete_event(
-            event_id=event_id,
-            status=status,
-            message=message,
-        )
+        try:
+            await self._client.complete_event(
+                event_id=event_id,
+                status=status,
+                message=message,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[%s] GRIX complete_event failed for %s: %s",
+                self.name,
+                event_id,
+                exc,
+            )
+            return
         self._completed_event_ids.add(event_id)
 
     async def _safe_release_lock(self) -> None:
