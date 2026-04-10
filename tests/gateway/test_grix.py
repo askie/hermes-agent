@@ -245,6 +245,89 @@ class TestGrixTransport:
         with pytest.raises(GrixAuthRejectedError):
             await connect_task
 
+    @pytest.mark.asyncio
+    async def test_send_timeout_disconnects_transport(self):
+        socket = FakeSocket()
+        statuses = []
+        client = GrixTransportClient(
+            _transport_config(),
+            connector=lambda _config: asyncio.sleep(0, result=socket),
+            on_status=statuses.append,
+        )
+
+        await _connect_client(client, socket)
+
+        with pytest.raises(TimeoutError, match="send_msg timeout"):
+            await client.send_text("g_1001", "hello", timeout_ms=20)
+
+        assert socket.closed is True
+        assert client.status["connected"] is False
+        assert client.status["authed"] is False
+        assert client.status["last_error"] == "send_msg timeout"
+        assert any(status["connected"] is False for status in statuses)
+
+    @pytest.mark.asyncio
+    async def test_reader_close_disconnects_without_self_cancel_recursion(self):
+        socket = FakeSocket()
+        client = GrixTransportClient(
+            _transport_config(),
+            connector=lambda _config: asyncio.sleep(0, result=socket),
+        )
+
+        await _connect_client(client, socket)
+        await socket._frames.put({"kind": "closed", "reason": "server closed"})
+
+        await _wait_for(lambda: socket.closed and client.status["connected"] is False)
+        assert client.status["last_error"] == "server closed"
+
+    @pytest.mark.asyncio
+    async def test_unsolicited_packet_handler_can_issue_followup_request(self):
+        socket = FakeSocket()
+        handled = asyncio.Event()
+        client: GrixTransportClient
+
+        async def on_packet(packet: dict) -> None:
+            if packet["cmd"] != "event_msg":
+                return
+            await client.request(
+                "session_route_bind",
+                {
+                    "channel": "grix",
+                    "account_id": "main",
+                    "route_session_key": "agent:main:grix:dm:g_1001",
+                    "session_id": "g_1001",
+                },
+                expected=("send_ack",),
+                timeout_ms=100,
+            )
+            handled.set()
+
+        client = GrixTransportClient(
+            _transport_config(),
+            connector=lambda _config: asyncio.sleep(0, result=socket),
+            on_packet=on_packet,
+        )
+
+        await _connect_client(client, socket)
+        await socket.push_packet(
+            build_packet(
+                "event_msg",
+                {
+                    "event_id": "evt-1",
+                    "session_id": "g_1001",
+                    "msg_id": "55",
+                    "content": "hello",
+                },
+                0,
+            )
+        )
+        await _wait_for(lambda: len(socket.sent_text) >= 2)
+        bind_packet = decode_packet(socket.sent_text[-1])
+        assert bind_packet["cmd"] == "session_route_bind"
+
+        await socket.push_packet(build_packet("send_ack", {"ok": True}, bind_packet["seq"]))
+        await _wait_for(handled.is_set)
+
 
 class TestGrixAdapter:
     @pytest.mark.asyncio

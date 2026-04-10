@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import logging
 import time
 from dataclasses import dataclass
@@ -162,10 +163,12 @@ class GrixTransportClient:
         self._socket: Optional[GrixSocket] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._packet_tasks: set[asyncio.Task] = set()
         self._pending: Dict[int, _PendingRequest] = {}
         self._seq = int(time.time() * 1000)
         self._auth_session: Optional[GrixAuthSession] = None
         self._disconnect_requested = False
+        self._disconnect_lock = asyncio.Lock()
         self._status = {
             "running": False,
             "connected": False,
@@ -208,33 +211,41 @@ class GrixTransportClient:
         return auth_session
 
     async def disconnect(self, reason: str = "") -> None:
-        self._disconnect_requested = True
+        async with self._disconnect_lock:
+            self._disconnect_requested = True
+            current_task = asyncio.current_task()
 
-        tasks = [task for task in (self._heartbeat_task, self._reader_task) if task]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            tasks = [
+                task
+                for task in (self._heartbeat_task, self._reader_task, *self._packet_tasks)
+                if task and task is not current_task
+            ]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-        self._reject_pending(GrixTransportError(reason or "grix transport disconnected"))
+            self._reject_pending(GrixTransportError(reason or "grix transport disconnected"))
 
-        socket = self._socket
-        self._socket = None
-        self._heartbeat_task = None
-        self._reader_task = None
-        if socket:
-            await socket.close(reason)
+            socket = self._socket
+            self._socket = None
+            self._heartbeat_task = None
+            self._reader_task = None
+            self._packet_tasks.clear()
+            if socket:
+                with suppress(Exception):
+                    await socket.close(reason)
 
-        self._auth_session = None
-        self._update_status(
-            {
-                "running": False,
-                "connected": False,
-                "authed": False,
-                "last_disconnect_at": _now_ms(),
-                "last_error": reason or None,
-            }
-        )
+            self._auth_session = None
+            self._update_status(
+                {
+                    "running": False,
+                    "connected": False,
+                    "authed": False,
+                    "last_disconnect_at": _now_ms(),
+                    "last_error": reason or None,
+                }
+            )
 
     async def authenticate(self) -> GrixAuthSession:
         packet = await self.request(
@@ -310,7 +321,11 @@ class GrixTransportClient:
                     pending.future.set_exception(asyncio.CancelledError())
             raise
 
-        return await future
+        try:
+            return await future
+        except TimeoutError as exc:
+            await self.disconnect(str(exc))
+            raise
 
     async def send_text(
         self,
@@ -549,15 +564,7 @@ class GrixTransportClient:
         except Exception as exc:
             if self._disconnect_requested:
                 return
-            self._reject_pending(exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
-            self._update_status(
-                {
-                    "connected": False,
-                    "authed": False,
-                    "last_disconnect_at": _now_ms(),
-                    "last_error": str(exc),
-                }
-            )
+            await self.disconnect(str(exc))
 
     async def _handle_packet_text(self, text: str) -> None:
         if not text:
@@ -581,7 +588,19 @@ class GrixTransportClient:
             return
 
         if self.on_packet:
+            task = asyncio.create_task(self._run_on_packet(packet))
+            self._packet_tasks.add(task)
+            task.add_done_callback(self._packet_tasks.discard)
+
+    async def _run_on_packet(self, packet: Dict[str, Any]) -> None:
+        if not self.on_packet:
+            return
+        try:
             await _maybe_await(self.on_packet(packet))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("GRIX packet handler failed for %s", packet.get("cmd"))
 
     async def _heartbeat_loop(self, heartbeat_sec: int) -> None:
         interval = max(heartbeat_sec, 5)
@@ -597,6 +616,8 @@ class GrixTransportClient:
         except asyncio.CancelledError:
             return
         except Exception as exc:
+            if self._disconnect_requested:
+                return
             await self.disconnect(f"heartbeat failed: {exc}")
 
     async def _send_packet_internal(
@@ -612,7 +633,11 @@ class GrixTransportClient:
         packet = build_packet(cmd, payload, out_seq)
         if not self._socket:
             raise GrixTransportError("grix websocket is not connected")
-        await self._socket.send_text(encode_packet(packet))
+        try:
+            await self._socket.send_text(encode_packet(packet))
+        except Exception as exc:
+            await self.disconnect(f"{cmd} send failed: {exc}")
+            raise GrixConnectionClosedError(str(exc) or f"{cmd} send failed") from exc
         return out_seq
 
     def _ensure_ready(self, *, require_authed: bool) -> None:

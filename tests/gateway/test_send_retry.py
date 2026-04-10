@@ -102,6 +102,9 @@ class TestIsTimeoutError:
     def test_write_timeout(self):
         assert _StubAdapter._is_timeout_error("WriteTimeout: send stalled")
 
+    def test_send_msg_timeout(self):
+        assert _StubAdapter._is_timeout_error("send_msg timeout")
+
     def test_connect_timeout_not_flagged(self):
         """ConnectTimeout is a connection error, not a delivery-ambiguous timeout."""
         assert not _StubAdapter._is_timeout_error("ConnectTimeout: host unreachable")
@@ -176,6 +179,19 @@ class TestSendWithRetryNetworkRetry:
             result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
         assert result.success
         assert len(adapter._send_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_platform_timeout_token_not_retried_even_if_retryable(self):
+        """Protocol-level send timeouts are delivery-ambiguous and must not be retried."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="send_msg timeout", retryable=True),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=3, base_delay=0)
+        mock_sleep.assert_not_called()
+        assert not result.success
+        assert len(adapter._send_calls) == 1
 
     @pytest.mark.asyncio
     async def test_retryable_flag_respected(self):

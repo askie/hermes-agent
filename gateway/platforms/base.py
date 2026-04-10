@@ -1379,7 +1379,16 @@ class BasePlatformAdapter(ABC):
         if not error:
             return False
         lowered = error.lower()
-        return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
+        if "connecttimeout" in lowered:
+            return False
+        return (
+            "timed out" in lowered
+            or "readtimeout" in lowered
+            or "writetimeout" in lowered
+            or lowered.endswith(" timeout")
+            or " timeout:" in lowered
+            or " timeout " in lowered
+        )
 
     async def _send_with_retry(
         self,
@@ -1410,12 +1419,12 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
-        is_network = result.retryable or self._is_retryable_error(error_str)
-
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
-        if not is_network and self._is_timeout_error(error_str):
+        if self._is_timeout_error(error_str):
             return result
+
+        is_network = result.retryable or self._is_retryable_error(error_str)
 
         if is_network:
             # Retry with exponential backoff for transient errors
