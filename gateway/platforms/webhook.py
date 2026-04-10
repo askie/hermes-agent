@@ -187,6 +187,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Cross-platform delivery — any platform with a gateway adapter
         if self.gateway_runner and deliver_type in (
+            "grix",
             "telegram",
             "discord",
             "slack",

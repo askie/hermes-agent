@@ -1,0 +1,647 @@
+"""Async websocket transport for the Grix/aibot protocol."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Dict, Optional, Protocol
+
+from gateway.platforms.grix_protocol import (
+    DEFAULT_REQUEST_TIMEOUT_MS,
+    GrixConnectionConfig,
+    build_auth_payload,
+    build_packet,
+    decode_packet,
+    encode_packet,
+    parse_code,
+    parse_heartbeat_sec,
+    parse_message,
+)
+
+logger = logging.getLogger(__name__)
+
+try:
+    import aiohttp
+    from aiohttp import ClientSession, ClientTimeout, WSMsgType
+
+    AIOHTTP_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised via requirement checks
+    aiohttp = None
+    ClientSession = Any
+    ClientTimeout = Any
+    WSMsgType = Any
+    AIOHTTP_AVAILABLE = False
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+async def _maybe_await(result: Any) -> Any:
+    if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+        return await result
+    return result
+
+
+class GrixTransportError(RuntimeError):
+    """Base transport failure."""
+
+
+class GrixPacketError(GrixTransportError):
+    """Request failed with an error packet."""
+
+    def __init__(self, cmd: str, code: int, message: str):
+        super().__init__(f"grix {cmd}: code={code} msg={message}")
+        self.cmd = cmd
+        self.code = code
+
+
+class GrixAuthRejectedError(GrixTransportError):
+    """Authentication was rejected by the server."""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(f"grix auth failed: code={code} msg={message}")
+        self.code = code
+
+
+class GrixConnectionClosedError(GrixTransportError):
+    """Socket closed unexpectedly."""
+
+
+class GrixDependencyError(GrixTransportError):
+    """Missing optional runtime dependency."""
+
+
+class GrixSocket(Protocol):
+    async def send_text(self, text: str) -> None: ...
+
+    async def receive(self) -> Dict[str, Any]: ...
+
+    async def close(self, reason: str = "") -> None: ...
+
+
+Connector = Callable[[GrixConnectionConfig], Awaitable[GrixSocket]]
+PacketHandler = Callable[[Dict[str, Any]], Awaitable[None] | None]
+StatusHandler = Callable[[Dict[str, Any]], Awaitable[None] | None]
+
+
+@dataclass(frozen=True)
+class GrixAuthSession:
+    heartbeat_sec: int
+    protocol: Optional[str] = None
+
+
+@dataclass
+class _PendingRequest:
+    expected: set[str]
+    future: asyncio.Future
+    timeout_handle: asyncio.TimerHandle
+
+
+class _AiohttpSocket:
+    def __init__(self, session: ClientSession, ws):
+        self._session = session
+        self._ws = ws
+
+    async def send_text(self, text: str) -> None:
+        await self._ws.send_str(text)
+
+    async def receive(self) -> Dict[str, Any]:
+        message = await self._ws.receive()
+        if message.type == WSMsgType.TEXT:
+            return {"kind": "text", "text": message.data}
+        if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING):
+            return {"kind": "closed", "reason": getattr(self._ws, "close_reason", "") or ""}
+        if message.type == WSMsgType.ERROR:
+            return {"kind": "error", "error": self._ws.exception()}
+        if message.type == WSMsgType.BINARY:
+            return {"kind": "text", "text": message.data.decode("utf-8", errors="replace")}
+        return {"kind": "error", "error": RuntimeError(f"unexpected websocket frame: {message.type}")}
+
+    async def close(self, reason: str = "") -> None:
+        try:
+            await self._ws.close(message=reason.encode("utf-8")[:120] if reason else b"")
+        finally:
+            await self._session.close()
+
+
+async def default_connector(config: GrixConnectionConfig) -> GrixSocket:
+    if not AIOHTTP_AVAILABLE:
+        raise GrixDependencyError("aiohttp is unavailable in this runtime")
+
+    timeout = ClientTimeout(total=max(config.connect_timeout_ms / 1000, 1))
+    session = ClientSession(timeout=timeout)
+    try:
+        ws = await session.ws_connect(
+            config.endpoint,
+            receive_timeout=None,
+            heartbeat=None,
+            timeout=max(config.connect_timeout_ms / 1000, 1),
+        )
+    except Exception:
+        await session.close()
+        raise
+    return _AiohttpSocket(session, ws)
+
+
+class GrixTransportClient:
+    def __init__(
+        self,
+        config: GrixConnectionConfig,
+        *,
+        connector: Optional[Connector] = None,
+        on_packet: Optional[PacketHandler] = None,
+        on_status: Optional[StatusHandler] = None,
+    ):
+        self._config = config
+        self._connector = connector or default_connector
+        self.on_packet = on_packet
+        self.on_status = on_status
+        self._socket: Optional[GrixSocket] = None
+        self._reader_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._pending: Dict[int, _PendingRequest] = {}
+        self._seq = int(time.time() * 1000)
+        self._auth_session: Optional[GrixAuthSession] = None
+        self._disconnect_requested = False
+        self._status = {
+            "running": False,
+            "connected": False,
+            "authed": False,
+            "last_error": None,
+            "last_connect_at": None,
+            "last_disconnect_at": None,
+        }
+
+    @property
+    def status(self) -> Dict[str, Any]:
+        return dict(self._status)
+
+    async def connect(self) -> GrixAuthSession:
+        if self._status["connected"] and self._auth_session:
+            return self._auth_session
+
+        self._disconnect_requested = False
+        self._update_status({"running": True, "last_error": None})
+        self._socket = await self._connector(self._config)
+        self._update_status(
+            {
+                "connected": True,
+                "last_connect_at": _now_ms(),
+                "last_error": None,
+            }
+        )
+        self._reader_task = asyncio.create_task(self._reader_loop())
+
+        try:
+            auth_session = await self.authenticate()
+        except Exception:
+            await self.disconnect("auth failed")
+            raise
+
+        self._auth_session = auth_session
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(auth_session.heartbeat_sec)
+        )
+        return auth_session
+
+    async def disconnect(self, reason: str = "") -> None:
+        self._disconnect_requested = True
+
+        tasks = [task for task in (self._heartbeat_task, self._reader_task) if task]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._reject_pending(GrixTransportError(reason or "grix transport disconnected"))
+
+        socket = self._socket
+        self._socket = None
+        self._heartbeat_task = None
+        self._reader_task = None
+        if socket:
+            await socket.close(reason)
+
+        self._auth_session = None
+        self._update_status(
+            {
+                "running": False,
+                "connected": False,
+                "authed": False,
+                "last_disconnect_at": _now_ms(),
+                "last_error": reason or None,
+            }
+        )
+
+    async def authenticate(self) -> GrixAuthSession:
+        packet = await self.request(
+            "auth",
+            build_auth_payload(self._config),
+            expected=("auth_ack",),
+            timeout_ms=10_000,
+            require_authed=False,
+        )
+        code = parse_code(packet["payload"])
+        if code != 0:
+            raise GrixAuthRejectedError(code, parse_message(packet["payload"]))
+
+        auth_session = GrixAuthSession(
+            heartbeat_sec=parse_heartbeat_sec(packet["payload"]),
+            protocol=(str(packet["payload"].get("protocol") or "").strip() or None),
+        )
+        self._update_status({"authed": True, "last_error": None})
+        return auth_session
+
+    async def send_packet(
+        self,
+        cmd: str,
+        payload: Dict[str, Any],
+        *,
+        seq: Optional[int] = None,
+        require_authed: bool = True,
+    ) -> int:
+        return await self._send_packet_internal(
+            cmd,
+            payload,
+            seq=seq,
+            require_authed=require_authed,
+        )
+
+    async def request(
+        self,
+        cmd: str,
+        payload: Dict[str, Any],
+        *,
+        expected: tuple[str, ...] | list[str],
+        timeout_ms: Optional[int] = None,
+        require_authed: bool = True,
+    ) -> Dict[str, Any]:
+        self._ensure_ready(require_authed=require_authed)
+        seq = self._next_seq()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        def _on_timeout() -> None:
+            pending = self._pending.pop(seq, None)
+            if pending and not pending.future.done():
+                pending.future.set_exception(TimeoutError(f"{cmd} timeout"))
+
+        handle = loop.call_later(
+            (timeout_ms or self._config.request_timeout_ms or DEFAULT_REQUEST_TIMEOUT_MS) / 1000,
+            _on_timeout,
+        )
+        self._pending[seq] = _PendingRequest(set(expected), future, handle)
+
+        try:
+            await self._send_packet_internal(
+                cmd,
+                payload,
+                seq=seq,
+                require_authed=require_authed,
+            )
+        except Exception:
+            pending = self._pending.pop(seq, None)
+            if pending:
+                pending.timeout_handle.cancel()
+                if not pending.future.done():
+                    pending.future.set_exception(asyncio.CancelledError())
+            raise
+
+        return await future
+
+    async def send_text(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        reply_to_message_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "session_id": session_id.strip(),
+            "msg_type": 1,
+            "content": text,
+        }
+        if reply_to_message_id:
+            payload["quoted_message_id"] = reply_to_message_id.strip()
+        if thread_id:
+            payload["thread_id"] = thread_id.strip()
+        if event_id:
+            payload["event_id"] = event_id.strip()
+
+        packet = await self.request(
+            "send_msg",
+            payload,
+            expected=("send_ack", "send_nack", "error"),
+            timeout_ms=timeout_ms,
+        )
+        if packet["cmd"] != "send_ack":
+            raise self._packet_error(packet)
+        return {
+            "ok": True,
+            "message_id": (
+                str(packet["payload"].get("msg_id") or packet["payload"].get("client_msg_id") or "").strip()
+                or None
+            ),
+            "packet": packet,
+        }
+
+    async def edit_message(
+        self,
+        session_id: str,
+        message_id: str,
+        text: str,
+        *,
+        timeout_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        packet = await self.request(
+            "edit_msg",
+            {
+                "session_id": session_id.strip(),
+                "msg_id": message_id.strip(),
+                "content": text,
+            },
+            expected=("send_ack", "send_nack", "error"),
+            timeout_ms=timeout_ms,
+        )
+        if packet["cmd"] != "send_ack":
+            raise self._packet_error(packet)
+        return {
+            "ok": True,
+            "session_id": str(packet["payload"].get("session_id") or session_id).strip(),
+            "message_id": str(packet["payload"].get("msg_id") or message_id).strip(),
+            "packet": packet,
+        }
+
+    async def set_session_activity(
+        self,
+        *,
+        session_id: str,
+        kind: str,
+        active: bool,
+        ttl_ms: Optional[int] = None,
+        ref_message_id: Optional[str] = None,
+        ref_event_id: Optional[str] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "session_id": session_id.strip(),
+            "kind": kind,
+            "active": active,
+        }
+        if ttl_ms is not None:
+            payload["ttl_ms"] = int(ttl_ms)
+        if ref_message_id:
+            payload["ref_msg_id"] = ref_message_id.strip()
+        if ref_event_id:
+            payload["ref_event_id"] = ref_event_id.strip()
+        await self.send_packet("session_activity_set", payload)
+
+    async def acknowledge_event(
+        self,
+        *,
+        event_id: str,
+        session_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+        received_at: Optional[int] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "event_id": event_id.strip(),
+            "received_at": received_at or _now_ms(),
+        }
+        if session_id:
+            payload["session_id"] = session_id.strip()
+        if message_id:
+            payload["msg_id"] = message_id.strip()
+        await self.send_packet("event_ack", payload)
+
+    async def complete_event(
+        self,
+        *,
+        event_id: str,
+        status: str,
+        code: Optional[str] = None,
+        message: Optional[str] = None,
+        updated_at: Optional[int] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "event_id": event_id.strip(),
+            "status": status,
+            "updated_at": updated_at or _now_ms(),
+        }
+        if code:
+            payload["code"] = code.strip()
+        if message:
+            payload["msg"] = message.strip()
+        await self.send_packet("event_result", payload)
+
+    async def acknowledge_stop(
+        self,
+        *,
+        event_id: str,
+        accepted: bool,
+        stop_id: Optional[str] = None,
+        updated_at: Optional[int] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "event_id": event_id.strip(),
+            "accepted": accepted,
+            "updated_at": updated_at or _now_ms(),
+        }
+        if stop_id:
+            payload["stop_id"] = stop_id.strip()
+        await self.send_packet("event_stop_ack", payload)
+
+    async def complete_stop(
+        self,
+        *,
+        event_id: str,
+        status: str,
+        stop_id: Optional[str] = None,
+        code: Optional[str] = None,
+        message: Optional[str] = None,
+        updated_at: Optional[int] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "event_id": event_id.strip(),
+            "status": status,
+            "updated_at": updated_at or _now_ms(),
+        }
+        if stop_id:
+            payload["stop_id"] = stop_id.strip()
+        if code:
+            payload["code"] = code.strip()
+        if message:
+            payload["msg"] = message.strip()
+        await self.send_packet("event_stop_result", payload)
+
+    async def bind_session_route(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        route_session_key: str,
+        session_id: str,
+        timeout_ms: Optional[int] = None,
+    ) -> None:
+        packet = await self.request(
+            "session_route_bind",
+            {
+                "channel": channel.strip(),
+                "account_id": account_id.strip(),
+                "route_session_key": route_session_key.strip(),
+                "session_id": session_id.strip(),
+            },
+            expected=("send_ack", "send_nack", "error"),
+            timeout_ms=timeout_ms,
+        )
+        if packet["cmd"] != "send_ack":
+            raise self._packet_error(packet)
+
+    async def resolve_session_route(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        route_session_key: str,
+        timeout_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        packet = await self.request(
+            "session_route_resolve",
+            {
+                "channel": channel.strip(),
+                "account_id": account_id.strip(),
+                "route_session_key": route_session_key.strip(),
+            },
+            expected=("send_ack", "send_nack", "error"),
+            timeout_ms=timeout_ms,
+        )
+        if packet["cmd"] != "send_ack":
+            raise self._packet_error(packet)
+
+        session_id = str(packet["payload"].get("session_id") or "").strip()
+        if not session_id:
+            raise GrixTransportError("session_route_resolve returned empty session_id")
+        return {
+            "channel": str(packet["payload"].get("channel") or "").strip(),
+            "account_id": str(packet["payload"].get("account_id") or "").strip(),
+            "route_session_key": str(packet["payload"].get("route_session_key") or "").strip(),
+            "session_id": session_id,
+        }
+
+    async def _reader_loop(self) -> None:
+        try:
+            while self._socket:
+                frame = await self._socket.receive()
+                kind = frame.get("kind")
+                if kind == "text":
+                    await self._handle_packet_text(frame.get("text", ""))
+                    continue
+                if kind == "closed":
+                    raise GrixConnectionClosedError(frame.get("reason") or "grix websocket closed")
+                raise GrixConnectionClosedError("grix websocket error")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            if self._disconnect_requested:
+                return
+            self._reject_pending(exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+            self._update_status(
+                {
+                    "connected": False,
+                    "authed": False,
+                    "last_disconnect_at": _now_ms(),
+                    "last_error": str(exc),
+                }
+            )
+
+    async def _handle_packet_text(self, text: str) -> None:
+        if not text:
+            return
+        packet = decode_packet(text)
+        if packet["cmd"] == "ping":
+            await self._send_packet_internal(
+                "pong",
+                {"ts": _now_ms()},
+                seq=packet["seq"] if packet["seq"] > 0 else None,
+                require_authed=False,
+            )
+            return
+
+        pending = self._pending.get(packet["seq"])
+        if pending and packet["cmd"] in pending.expected:
+            self._pending.pop(packet["seq"], None)
+            pending.timeout_handle.cancel()
+            if not pending.future.done():
+                pending.future.set_result(packet)
+            return
+
+        if self.on_packet:
+            await _maybe_await(self.on_packet(packet))
+
+    async def _heartbeat_loop(self, heartbeat_sec: int) -> None:
+        interval = max(heartbeat_sec, 5)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await self.request(
+                    "ping",
+                    {"ts": _now_ms()},
+                    expected=("pong",),
+                    timeout_ms=min(interval * 1000, 15_000),
+                )
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            await self.disconnect(f"heartbeat failed: {exc}")
+
+    async def _send_packet_internal(
+        self,
+        cmd: str,
+        payload: Dict[str, Any],
+        *,
+        seq: Optional[int],
+        require_authed: bool,
+    ) -> int:
+        self._ensure_ready(require_authed=require_authed)
+        out_seq = seq or self._next_seq()
+        packet = build_packet(cmd, payload, out_seq)
+        if not self._socket:
+            raise GrixTransportError("grix websocket is not connected")
+        await self._socket.send_text(encode_packet(packet))
+        return out_seq
+
+    def _ensure_ready(self, *, require_authed: bool) -> None:
+        if not self._socket or not self._status["connected"]:
+            raise GrixTransportError("grix websocket is not connected")
+        if require_authed and not self._status["authed"]:
+            raise GrixTransportError("grix websocket is not authenticated")
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def _packet_error(self, packet: Dict[str, Any]) -> GrixPacketError:
+        return GrixPacketError(
+            packet["cmd"],
+            parse_code(packet["payload"]),
+            parse_message(packet["payload"]),
+        )
+
+    def _reject_pending(self, error: Exception) -> None:
+        for seq, pending in list(self._pending.items()):
+            pending.timeout_handle.cancel()
+            if not pending.future.done():
+                pending.future.set_exception(error)
+            self._pending.pop(seq, None)
+
+    def _update_status(self, patch: Dict[str, Any]) -> None:
+        self._status.update(patch)
+        if self.on_status:
+            result = self.on_status(dict(self._status))
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)

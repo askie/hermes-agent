@@ -173,6 +173,7 @@ class SessionContext:
 
 
 _PII_SAFE_PLATFORMS = frozenset({
+    Platform.GRIX,
     Platform.WHATSAPP,
     Platform.SIGNAL,
     Platform.TELEGRAM,

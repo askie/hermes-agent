@@ -649,3 +649,12 @@ class TestUpdateInHelp:
         import inspect
         source = inspect.getsource(GatewayRunner._handle_message)
         assert '"update"' in source
+
+
+class TestUpdateAllowedPlatforms:
+    """Verify /update is enabled for all supported chat platforms."""
+
+    def test_grix_is_in_update_allowed_platforms(self):
+        from gateway.run import GatewayRunner
+
+        assert Platform.GRIX in GatewayRunner._UPDATE_ALLOWED_PLATFORMS

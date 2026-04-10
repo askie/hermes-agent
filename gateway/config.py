@@ -48,6 +48,7 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
 class Platform(Enum):
     """Supported messaging platforms."""
     LOCAL = "local"
+    GRIX = "grix"
     TELEGRAM = "telegram"
     DISCORD = "discord"
     WHATSAPP = "whatsapp"
@@ -750,6 +751,54 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
+
+    # Grix / aibot protocol bridge
+    grix_endpoint = os.getenv("GRIX_ENDPOINT")
+    grix_agent_id = os.getenv("GRIX_AGENT_ID")
+    grix_api_key = os.getenv("GRIX_API_KEY")
+    if grix_endpoint or grix_agent_id or grix_api_key:
+        if not all([grix_endpoint, grix_agent_id, grix_api_key]):
+            logger.warning("GRIX_ENDPOINT, GRIX_AGENT_ID, and GRIX_API_KEY must all be set together")
+        else:
+            if Platform.GRIX not in config.platforms:
+                config.platforms[Platform.GRIX] = PlatformConfig()
+            config.platforms[Platform.GRIX].enabled = True
+            config.platforms[Platform.GRIX].api_key = grix_api_key
+            config.platforms[Platform.GRIX].extra.update({
+                "endpoint": grix_endpoint,
+                "agent_id": grix_agent_id,
+                "account_id": os.getenv("GRIX_ACCOUNT_ID", "main"),
+                "client": os.getenv("GRIX_CLIENT", "hermes-agent"),
+                "client_type": os.getenv("GRIX_CLIENT_TYPE", "hermes"),
+            })
+
+            grix_capabilities = os.getenv("GRIX_CAPABILITIES", "")
+            if grix_capabilities:
+                config.platforms[Platform.GRIX].extra["capabilities"] = [
+                    entry.strip() for entry in grix_capabilities.split(",") if entry.strip()
+                ]
+
+            grix_connect_timeout_ms = os.getenv("GRIX_CONNECT_TIMEOUT_MS", "")
+            if grix_connect_timeout_ms:
+                try:
+                    config.platforms[Platform.GRIX].extra["connect_timeout_ms"] = int(grix_connect_timeout_ms)
+                except ValueError:
+                    logger.warning("Invalid GRIX_CONNECT_TIMEOUT_MS: %s", grix_connect_timeout_ms)
+
+            grix_request_timeout_ms = os.getenv("GRIX_REQUEST_TIMEOUT_MS", "")
+            if grix_request_timeout_ms:
+                try:
+                    config.platforms[Platform.GRIX].extra["request_timeout_ms"] = int(grix_request_timeout_ms)
+                except ValueError:
+                    logger.warning("Invalid GRIX_REQUEST_TIMEOUT_MS: %s", grix_request_timeout_ms)
+
+    grix_home = os.getenv("GRIX_HOME_CHANNEL")
+    if grix_home and Platform.GRIX in config.platforms:
+        config.platforms[Platform.GRIX].home_channel = HomeChannel(
+            platform=Platform.GRIX,
+            chat_id=grix_home,
+            name=os.getenv("GRIX_HOME_CHANNEL_NAME", "Home"),
+        )
     
     # Telegram
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")

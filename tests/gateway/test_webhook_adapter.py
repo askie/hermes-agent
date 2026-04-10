@@ -758,3 +758,16 @@ class TestDeliverCrossPlatformThreadId:
         mock_target.send.assert_awaited_once_with(
             "12345", "hello", metadata=None
         )
+
+    @pytest.mark.asyncio
+    async def test_send_routes_grix_delivery_to_cross_platform_handler(self):
+        """Webhook send() accepts grix as a cross-platform delivery target."""
+        adapter = _make_adapter()
+        adapter.gateway_runner = MagicMock()
+        adapter._delivery_info["webhook:test:1"] = {"deliver": "grix"}
+        adapter._deliver_cross_platform = AsyncMock(return_value=SendResult(success=True))
+
+        result = await adapter.send("webhook:test:1", "hello")
+
+        assert result.success is True
+        adapter._deliver_cross_platform.assert_awaited_once_with("grix", "hello", {"deliver": "grix"})
