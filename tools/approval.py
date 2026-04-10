@@ -15,6 +15,7 @@ import re
 import sys
 import threading
 import unicodedata
+import uuid
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -230,6 +231,11 @@ _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, 
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
 
+def _new_gateway_approval_id() -> str:
+    """Return a compact approval id for gateway-backed approval requests."""
+    return f"ga_{uuid.uuid4().hex[:12]}"
+
+
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
 
@@ -282,6 +288,31 @@ def resolve_gateway_approval(session_key: str, choice: str,
         entry.result = choice
         entry.event.set()
     return len(targets)
+
+
+def resolve_gateway_approval_by_id(approval_id: str, choice: str) -> Optional[str]:
+    """Resolve one pending gateway approval by its approval id.
+
+    Returns the owning session key when an approval was resolved, or ``None``
+    if the approval id is unknown/stale.
+    """
+    normalized_id = str(approval_id or "").strip()
+    if not normalized_id:
+        return None
+
+    with _lock:
+        for session_key, queue in list(_gateway_queues.items()):
+            for index, entry in enumerate(queue):
+                entry_id = str(entry.data.get("approval_id") or "").strip()
+                if entry_id != normalized_id:
+                    continue
+                queue.pop(index)
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+                entry.result = choice
+                entry.event.set()
+                return session_key
+    return None
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -807,6 +838,7 @@ def check_all_command_guards(command: str, env_type: str,
             # Each call gets its own _ApprovalEntry so parallel subagents
             # and execute_code threads can block concurrently.
             approval_data = {
+                "approval_id": _new_gateway_approval_id(),
                 "command": command,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,

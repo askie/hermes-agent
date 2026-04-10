@@ -156,6 +156,24 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_resolve_by_id_targets_matching_entry(self):
+        from tools.approval import (
+            resolve_gateway_approval_by_id, pending_approval_count,
+            _ApprovalEntry, _gateway_queues,
+        )
+        session_key = "test-by-id"
+        e1 = _ApprovalEntry({"command": "first", "approval_id": "appr-1"})
+        e2 = _ApprovalEntry({"command": "second", "approval_id": "appr-2"})
+        _gateway_queues[session_key] = [e1, e2]
+
+        resolved_session = resolve_gateway_approval_by_id("appr-2", "always")
+
+        assert resolved_session == session_key
+        assert not e1.event.is_set()
+        assert e2.event.is_set()
+        assert e2.result == "always"
+        assert pending_approval_count(session_key) == 1
+
     def test_unregister_signals_all_entries(self):
         """unregister_gateway_notify signals all waiting entries to prevent hangs."""
         from tools.approval import (
@@ -610,6 +628,29 @@ class TestFallbackNoCallback:
 
     def setup_method(self):
         _clear_approval_state()
+        self._env_patch = patch.dict(
+            os.environ,
+            {
+                "HERMES_YOLO_MODE": "",
+            },
+            clear=False,
+        )
+        self._env_patch.start()
+        self._approval_mode_patch = patch(
+            "tools.approval._get_approval_mode",
+            return_value="manual",
+        )
+        self._approval_mode_patch.start()
+        self._tirith_patch = patch(
+            "tools.tirith_security.check_command_security",
+            return_value={"action": "allow", "findings": [], "summary": ""},
+        )
+        self._tirith_patch.start()
+
+    def teardown_method(self):
+        self._tirith_patch.stop()
+        self._approval_mode_patch.stop()
+        self._env_patch.stop()
 
     def test_no_callback_returns_approval_required(self):
         """Without a registered callback, the old approval_required path is used."""

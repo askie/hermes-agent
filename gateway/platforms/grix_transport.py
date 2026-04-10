@@ -416,6 +416,27 @@ class GrixTransportClient:
             payload["ref_event_id"] = ref_event_id.strip()
         await self.send_packet("session_activity_set", payload)
 
+    async def send_local_action_result(
+        self,
+        *,
+        action_id: str,
+        status: str,
+        result: Optional[Any] = None,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "action_id": action_id.strip(),
+            "status": status.strip(),
+        }
+        if result is not None:
+            payload["result"] = result
+        if error_code:
+            payload["error_code"] = error_code.strip()
+        if error_message:
+            payload["error_msg"] = error_message.strip()
+        await self.send_packet("local_action_result", payload)
+
     async def acknowledge_event(
         self,
         *,
