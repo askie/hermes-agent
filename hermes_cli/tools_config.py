@@ -121,6 +121,7 @@ def _get_plugin_toolset_keys() -> set:
 # Platform display config
 PLATFORMS = {
     "cli":      {"label": "🖥️  CLI",       "default_toolset": "hermes-cli"},
+    "grix":     {"label": "🧩 Grix",       "default_toolset": "hermes-grix"},
     "telegram": {"label": "📱 Telegram",   "default_toolset": "hermes-telegram"},
     "discord":  {"label": "💬 Discord",    "default_toolset": "hermes-discord"},
     "slack":    {"label": "💼 Slack",      "default_toolset": "hermes-slack"},

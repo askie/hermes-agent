@@ -17,6 +17,8 @@ from agent.redact import redact_sensitive_text
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
+_GRIX_TARGET_RE = re.compile(r"^\s*([A-Za-z0-9_.@-]+)(?::([A-Za-z0-9_.@-]+))?\s*$")
+_GRIX_ROUTE_SESSION_KEY_RE = re.compile(r"^\s*agent:main:grix:(?:dm|group):.+\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
@@ -65,7 +67,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or Telegram topic 'telegram:chat_id:thread_id'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:#bot-home', 'slack:#engineering', 'signal:+15551234567'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or threaded targets like 'telegram:chat_id:thread_id' and 'grix:session_id:thread_id'. Grix also accepts a bound Hermes session key as the target body. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:#bot-home', 'slack:#engineering', 'signal:+15551234567', 'grix:g_1001:topic-a', 'grix:agent:main:grix:group:g_1001:topic-a'"
             },
             "message": {
                 "type": "string",
@@ -143,6 +145,7 @@ def _handle_send(args):
         return json.dumps(_error(f"Failed to load gateway config: {e}"))
 
     platform_map = {
+        "grix": Platform.GRIX,
         "telegram": Platform.TELEGRAM,
         "discord": Platform.DISCORD,
         "slack": Platform.SLACK,
@@ -223,6 +226,12 @@ def _handle_send(args):
 
 def _parse_target_ref(platform_name: str, target_ref: str):
     """Parse a tool target into chat_id/thread_id and whether it is explicit."""
+    if platform_name == "grix":
+        if _GRIX_ROUTE_SESSION_KEY_RE.fullmatch(target_ref):
+            return target_ref.strip(), None, True
+        match = _GRIX_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), match.group(2), True
     if platform_name == "telegram":
         match = _TELEGRAM_TOPIC_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -309,6 +318,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     """
     from gateway.config import Platform
     from gateway.platforms.base import BasePlatformAdapter
+    from gateway.platforms.grix import GrixAdapter
     from gateway.platforms.telegram import TelegramAdapter
     from gateway.platforms.discord import DiscordAdapter
     from gateway.platforms.slack import SlackAdapter
@@ -331,6 +341,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     # Platform message length limits (from adapter class attributes)
     _MAX_LENGTHS = {
+        Platform.GRIX: GrixAdapter.MAX_MESSAGE_LENGTH,
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH,
         Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
@@ -380,7 +391,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     last_result = None
     for chunk in chunks:
-        if platform == Platform.DISCORD:
+        if platform == Platform.GRIX:
+            result = await _send_grix(pconfig, chat_id, chunk, thread_id=thread_id)
+        elif platform == Platform.DISCORD:
             result = await _send_discord(pconfig.token, chat_id, chunk)
         elif platform == Platform.SLACK:
             result = await _send_slack(pconfig.token, chat_id, chunk)
@@ -418,6 +431,41 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         warnings.append(warning)
         last_result["warnings"] = warnings
     return last_result
+
+
+async def _send_grix(pconfig, chat_id, message, thread_id=None):
+    """Send a standalone message through the Grix websocket transport."""
+    try:
+        from gateway.platforms.grix import build_grix_connection_config, resolve_grix_target
+        from gateway.platforms.grix_transport import GrixTransportClient
+
+        connection = build_grix_connection_config(pconfig)
+        client = GrixTransportClient(connection)
+        await client.connect()
+        try:
+            resolved_chat_id, resolved_thread_id = await resolve_grix_target(
+                client,
+                connection,
+                str(chat_id),
+                thread_id=thread_id,
+            )
+            receipt = await client.send_text(
+                resolved_chat_id,
+                message,
+                thread_id=resolved_thread_id,
+            )
+        finally:
+            await client.disconnect()
+        return {
+            "success": True,
+            "platform": "grix",
+            "chat_id": chat_id,
+            "message_id": receipt.get("message_id"),
+        }
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    except Exception as e:
+        return _error(f"Grix send failed: {e}")
 
 
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None):

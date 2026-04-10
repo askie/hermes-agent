@@ -18,6 +18,7 @@ from hermes_cli.colors import Colors, color
 
 PLATFORMS = {
     "cli":      "🖥️  CLI",
+    "grix":     "🧩 Grix",
     "telegram": "📱 Telegram",
     "discord":  "💬 Discord",
     "slack":    "💼 Slack",

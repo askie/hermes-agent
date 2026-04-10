@@ -188,6 +188,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Cross-platform delivery (telegram, discord, etc.)
         if self.gateway_runner and deliver_type in (
+            "grix",
             "telegram",
             "discord",
             "slack",
