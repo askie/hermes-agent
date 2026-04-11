@@ -621,8 +621,8 @@ class GatewayRunner:
             logger.debug("SQLite session store not available: %s", e)
         
         # DM pairing store for code-based user authorization
-        from gateway.pairing import PairingStore
-        self.pairing_store = PairingStore()
+        from gateway.pairing import PairingStore, resolve_pairing_dir
+        self.pairing_store = PairingStore(base_dir=resolve_pairing_dir(_hermes_home))
         
         # Event hook system
         from gateway.hooks import HookRegistry

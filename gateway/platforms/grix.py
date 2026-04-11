@@ -10,6 +10,27 @@ import re
 from typing import Any, Dict, Optional
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.aibot_contract import (
+    CMD_EVENT_EDIT,
+    CMD_EVENT_MSG,
+    CMD_EVENT_REVOKE,
+    CMD_EVENT_STOP,
+    CMD_LOCAL_ACTION,
+    ERR_APPROVAL_NOT_FOUND,
+    ERR_INVALID_LOCAL_ACTION,
+    ERR_MISSING_APPROVAL_ID,
+    ERR_STOP_HANDLER_FAILED,
+    ERR_UNSUPPORTED_DECISION,
+    ERR_UNSUPPORTED_LOCAL_ACTION,
+    LOCAL_ACTION_EXEC_APPROVE,
+    LOCAL_ACTION_EXEC_REJECT,
+    STATUS_ALREADY_FINISHED,
+    STATUS_FAILED,
+    STATUS_OK,
+    STATUS_RESPONDED,
+    STATUS_STOPPED,
+    STATUS_UNSUPPORTED,
+)
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.platforms.grix_protocol import (
     GrixConnectionConfig,
@@ -67,19 +88,15 @@ def _strip_markdown(text: str) -> str:
 
 
 def _approval_lookup_id(params: Dict[str, Any]) -> str:
-    for key in ("approval_id", "approval_command_id", "exec_context_id"):
-        value = str(params.get(key) or "").strip()
-        if value:
-            return value
-    return ""
+    return str(params.get("approval_id") or "").strip()
 
 
 def _approval_choice_from_action(action_type: str, params: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
     normalized_action = str(action_type or "").strip()
     decision = str(params.get("decision") or "").strip()
-    if normalized_action == "exec_reject":
+    if normalized_action == LOCAL_ACTION_EXEC_REJECT:
         return "deny", "deny"
-    if normalized_action != "exec_approve":
+    if normalized_action != LOCAL_ACTION_EXEC_APPROVE:
         return None, None
 
     if decision == "allow-once":
@@ -404,7 +421,7 @@ class GrixAdapter(BasePlatformAdapter):
                 event_id=event_id,
             )
             if event_id:
-                await self._complete_event_if_needed(event_id, status="responded")
+                await self._complete_event_if_needed(event_id, status=STATUS_RESPONDED)
             return SendResult(
                 success=bool(receipt.get("ok")),
                 message_id=receipt.get("message_id"),
@@ -415,7 +432,7 @@ class GrixAdapter(BasePlatformAdapter):
             if event_id:
                 await self._complete_event_if_needed(
                     event_id,
-                    status="failed",
+                    status=STATUS_FAILED,
                     message=str(exc),
                 )
             return SendResult(
@@ -560,7 +577,7 @@ class GrixAdapter(BasePlatformAdapter):
         if not isinstance(event_id, str) or not event_id.strip():
             return
 
-        status = "responded" if success else "failed"
+        status = STATUS_RESPONDED if success else STATUS_FAILED
         message = None if success else "message processing failed"
         await self._complete_event_if_needed(event_id.strip(), status=status, message=message)
 
@@ -580,15 +597,15 @@ class GrixAdapter(BasePlatformAdapter):
         cmd = packet.get("cmd")
         payload = packet.get("payload") or {}
         try:
-            if cmd == "event_msg":
+            if cmd == CMD_EVENT_MSG:
                 await self._handle_message_packet(payload)
-            elif cmd == "local_action":
+            elif cmd == CMD_LOCAL_ACTION:
                 await self._handle_local_action_packet(payload)
-            elif cmd == "event_stop":
+            elif cmd == CMD_EVENT_STOP:
                 await self._handle_stop_packet(payload)
-            elif cmd == "event_edit":
+            elif cmd == CMD_EVENT_EDIT:
                 await self._handle_edit_packet(payload)
-            elif cmd == "event_revoke":
+            elif cmd == CMD_EVENT_REVOKE:
                 await self._handle_revoke_packet(payload)
             else:
                 logger.debug("[%s] Ignoring unknown GRIX packet %s", self.name, cmd)
@@ -603,17 +620,17 @@ class GrixAdapter(BasePlatformAdapter):
         if not action.action_id or not action.action_type:
             await self._client.send_local_action_result(
                 action_id=action.action_id or "unknown",
-                status="failed",
-                error_code="invalid_local_action",
+                status=STATUS_FAILED,
+                error_code=ERR_INVALID_LOCAL_ACTION,
                 error_message="missing action_id or action_type",
             )
             return
 
-        if action.action_type not in {"exec_approve", "exec_reject"}:
+        if action.action_type not in {LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT}:
             await self._client.send_local_action_result(
                 action_id=action.action_id,
-                status="unsupported",
-                error_code="unsupported_local_action",
+                status=STATUS_UNSUPPORTED,
+                error_code=ERR_UNSUPPORTED_LOCAL_ACTION,
                 error_message=f"unsupported local action: {action.action_type}",
             )
             return
@@ -622,8 +639,8 @@ class GrixAdapter(BasePlatformAdapter):
         if not approval_id:
             await self._client.send_local_action_result(
                 action_id=action.action_id,
-                status="failed",
-                error_code="missing_approval_id",
+                status=STATUS_FAILED,
+                error_code=ERR_MISSING_APPROVAL_ID,
                 error_message="approval_id is required",
             )
             return
@@ -632,8 +649,8 @@ class GrixAdapter(BasePlatformAdapter):
         if approval_choice is None:
             await self._client.send_local_action_result(
                 action_id=action.action_id,
-                status="failed",
-                error_code="unsupported_decision",
+                status=STATUS_FAILED,
+                error_code=ERR_UNSUPPORTED_DECISION,
                 error_message=f"unsupported approval decision: {decision_value or action.action_type}",
             )
             return
@@ -645,8 +662,8 @@ class GrixAdapter(BasePlatformAdapter):
         if session_key is None:
             await self._client.send_local_action_result(
                 action_id=action.action_id,
-                status="failed",
-                error_code="approval_not_found",
+                status=STATUS_FAILED,
+                error_code=ERR_APPROVAL_NOT_FOUND,
                 error_message="unknown or expired approval id",
             )
             return
@@ -658,7 +675,7 @@ class GrixAdapter(BasePlatformAdapter):
 
         await self._client.send_local_action_result(
             action_id=action.action_id,
-            status="ok",
+            status=STATUS_OK,
             result=decision_value or approval_choice,
         )
 
@@ -722,7 +739,7 @@ class GrixAdapter(BasePlatformAdapter):
             if self._client:
                 await self._complete_event_if_needed(
                     message.event_id,
-                    status="failed",
+                    status=STATUS_FAILED,
                     message=str(exc),
                 )
             raise
@@ -820,15 +837,15 @@ class GrixAdapter(BasePlatformAdapter):
                 await self._client.complete_stop(
                     event_id=stop.event_id,
                     stop_id=stop.stop_id,
-                    status="stopped" if was_active else "already_finished",
+                    status=STATUS_STOPPED if was_active else STATUS_ALREADY_FINISHED,
                 )
         except Exception as exc:
             if self._client:
                 await self._client.complete_stop(
                     event_id=stop.event_id,
                     stop_id=stop.stop_id,
-                    status="failed",
-                    code="stop_handler_failed",
+                    status=STATUS_FAILED,
+                    code=ERR_STOP_HANDLER_FAILED,
                     message=str(exc),
                 )
             raise

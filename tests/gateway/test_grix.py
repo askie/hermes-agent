@@ -8,6 +8,22 @@ from unittest.mock import patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig, _apply_env_overrides
+from gateway.platforms.aibot_contract import (
+    AIBOT_PROTOCOL_VERSION,
+    CAP_LOCAL_ACTION_V1,
+    CMD_AUTH,
+    CMD_AUTH_ACK,
+    CMD_PING,
+    CMD_PONG,
+    CMD_SEND_ACK,
+    CMD_SEND_MSG,
+    CMD_SESSION_ROUTE_BIND,
+    LOCAL_ACTION_EXEC_APPROVE,
+    LOCAL_ACTION_EXEC_REJECT,
+    STATUS_RESPONDED,
+    ERR_APPROVAL_NOT_FOUND,
+    ERR_UNSUPPORTED_LOCAL_ACTION,
+)
 from gateway.platforms.base import MessageEvent
 from gateway.platforms.grix import GrixAdapter, build_grix_connection_config, check_grix_requirements
 from gateway.platforms.grix_protocol import (
@@ -62,14 +78,14 @@ async def _connect_client(client: GrixTransportClient, socket: FakeSocket) -> No
     connect_task = asyncio.create_task(client.connect())
     await _wait_for(lambda: len(socket.sent_text) >= 1)
     auth_packet = decode_packet(socket.sent_text[0])
-    assert auth_packet["cmd"] == "auth"
+    assert auth_packet["cmd"] == CMD_AUTH
     await socket.push_packet(
         build_packet(
-            "auth_ack",
+            CMD_AUTH_ACK,
             {
                 "code": 0,
                 "heartbeat_sec": 30,
-                "protocol": "aibot-agent-api-v1",
+                "protocol": AIBOT_PROTOCOL_VERSION,
             },
             auth_packet["seq"],
         )
@@ -202,13 +218,13 @@ class TestGrixTooling:
         assert built.agent_id == "9001"
         assert built.api_key == "secret"
         assert built.account_id == "main"
-        assert "local_action_v1" in built.capabilities
-        assert built.local_actions == ["exec_approve", "exec_reject"]
+        assert CAP_LOCAL_ACTION_V1 in built.capabilities
+        assert built.local_actions == [LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT]
 
     def test_build_auth_payload_includes_local_actions(self):
         payload = build_auth_payload(_transport_config())
-        assert "local_action_v1" in payload["capabilities"]
-        assert payload["local_actions"] == ["exec_approve", "exec_reject"]
+        assert CAP_LOCAL_ACTION_V1 in payload["capabilities"]
+        assert payload["local_actions"] == [LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT]
 
 
 class TestGrixTransport:
@@ -227,17 +243,17 @@ class TestGrixTransport:
         send_task = asyncio.create_task(client.send_text("g_1001", "hello"))
         await _wait_for(lambda: len(socket.sent_text) >= 2)
         send_packet = decode_packet(socket.sent_text[-1])
-        assert send_packet["cmd"] == "send_msg"
-        await socket.push_packet(build_packet("send_ack", {"msg_id": "55"}, send_packet["seq"]))
+        assert send_packet["cmd"] == CMD_SEND_MSG
+        await socket.push_packet(build_packet(CMD_SEND_ACK, {"msg_id": "55"}, send_packet["seq"]))
 
         receipt = await send_task
         assert receipt["ok"] is True
         assert receipt["message_id"] == "55"
 
-        await socket.push_packet(build_packet("ping", {"ts": 1}, 44))
+        await socket.push_packet(build_packet(CMD_PING, {"ts": 1}, 44))
         await _wait_for(lambda: len(socket.sent_text) >= 3)
         pong_packet = decode_packet(socket.sent_text[-1])
-        assert pong_packet["cmd"] == "pong"
+        assert pong_packet["cmd"] == CMD_PONG
         assert pong_packet["seq"] == 44
 
         await client.disconnect()
@@ -253,7 +269,7 @@ class TestGrixTransport:
         connect_task = asyncio.create_task(client.connect())
         await _wait_for(lambda: len(socket.sent_text) >= 1)
         auth_packet = decode_packet(socket.sent_text[0])
-        await socket.push_packet(build_packet("auth_ack", {"code": 10401, "msg": "bad key"}, auth_packet["seq"]))
+        await socket.push_packet(build_packet(CMD_AUTH_ACK, {"code": 10401, "msg": "bad key"}, auth_packet["seq"]))
         with pytest.raises(GrixAuthRejectedError):
             await connect_task
 
@@ -302,14 +318,14 @@ class TestGrixTransport:
             if packet["cmd"] != "event_msg":
                 return
             await client.request(
-                "session_route_bind",
+                CMD_SESSION_ROUTE_BIND,
                 {
                     "channel": "grix",
                     "account_id": "main",
                     "route_session_key": "agent:main:grix:dm:g_1001",
                     "session_id": "g_1001",
                 },
-                expected=("send_ack",),
+                expected=(CMD_SEND_ACK,),
                 timeout_ms=100,
             )
             handled.set()
@@ -335,9 +351,9 @@ class TestGrixTransport:
         )
         await _wait_for(lambda: len(socket.sent_text) >= 2)
         bind_packet = decode_packet(socket.sent_text[-1])
-        assert bind_packet["cmd"] == "session_route_bind"
+        assert bind_packet["cmd"] == CMD_SESSION_ROUTE_BIND
 
-        await socket.push_packet(build_packet("send_ack", {"ok": True}, bind_packet["seq"]))
+        await socket.push_packet(build_packet(CMD_SEND_ACK, {"ok": True}, bind_packet["seq"]))
         await _wait_for(handled.is_set)
 
 
@@ -398,7 +414,7 @@ class TestGrixAdapter:
         assert fake_client.sent[0]["event_id"] == "evt-1"
         assert fake_client.sent[0]["reply_to_message_id"] == "55"
         assert fake_client.sent[0]["text"] == "hello back"
-        assert fake_client.completed_events[0]["status"] == "responded"
+        assert fake_client.completed_events[0]["status"] == STATUS_RESPONDED
 
     @pytest.mark.asyncio
     async def test_event_stop_dispatches_stop_command(self):
@@ -528,7 +544,7 @@ class TestGrixAdapter:
                     "seq": 0,
                     "payload": {
                         "action_id": "act-1",
-                        "action_type": "exec_approve",
+                        "action_type": LOCAL_ACTION_EXEC_APPROVE,
                         "params": {
                             "approval_id": "req_123",
                             "decision": "allow-once",
@@ -568,7 +584,7 @@ class TestGrixAdapter:
                     "seq": 0,
                     "payload": {
                         "action_id": "act-404",
-                        "action_type": "exec_approve",
+                        "action_type": LOCAL_ACTION_EXEC_APPROVE,
                         "params": {
                             "approval_id": "req_404",
                             "decision": "allow-once",
@@ -581,7 +597,7 @@ class TestGrixAdapter:
             {
                 "action_id": "act-404",
                 "status": "failed",
-                "error_code": "approval_not_found",
+                "error_code": ERR_APPROVAL_NOT_FOUND,
                 "error_message": "unknown or expired approval id",
             }
         ]
@@ -614,7 +630,7 @@ class TestGrixAdapter:
             {
                 "action_id": "act-unsupported",
                 "status": "unsupported",
-                "error_code": "unsupported_local_action",
+                "error_code": ERR_UNSUPPORTED_LOCAL_ACTION,
                 "error_message": "unsupported local action: open_url",
             }
         ]
