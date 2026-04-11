@@ -527,6 +527,7 @@ class TestInboundMessages:
         from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0  # disable batching for tests
         adapter.handle_message = AsyncMock()
         adapter._extract_media = AsyncMock(return_value=(["/tmp/test.png"], ["image/png"]))
 
@@ -558,6 +559,7 @@ class TestInboundMessages:
         from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._text_batch_delay_seconds = 0  # disable batching for tests
         adapter.handle_message = AsyncMock()
         adapter._extract_media = AsyncMock(return_value=([], []))
 
