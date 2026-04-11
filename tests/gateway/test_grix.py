@@ -153,6 +153,18 @@ class FakeProtocolClient:
         self.local_action_results.append(kwargs)
 
 
+class SlowBindProtocolClient(FakeProtocolClient):
+    def __init__(self):
+        super().__init__()
+        self.bind_started = asyncio.Event()
+        self.release_bind = asyncio.Event()
+
+    async def bind_session_route(self, **kwargs):
+        self.bound_routes.append(kwargs)
+        self.bind_started.set()
+        await self.release_bind.wait()
+
+
 class TestGrixConfig:
     def test_grix_enum_exists(self):
         assert Platform.GRIX.value == "grix"
@@ -416,6 +428,57 @@ class TestGrixAdapter:
         assert fake_client.sent[0]["reply_to_message_id"] == "55"
         assert fake_client.sent[0]["text"] == "hello back"
         assert fake_client.completed_events[0]["status"] == STATUS_RESPONDED
+
+    @pytest.mark.asyncio
+    async def test_event_msg_acknowledges_before_route_bind_completes(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = SlowBindProtocolClient()
+        adapter._client = fake_client
+
+        seen_events = []
+
+        async def handler(event):
+            seen_events.append(event)
+            return "hello back"
+
+        adapter.set_message_handler(handler)
+        packet_task = asyncio.create_task(
+            adapter._handle_protocol_packet(
+                {
+                    "cmd": "event_msg",
+                    "seq": 0,
+                    "payload": {
+                        "event_id": "evt-2",
+                        "event_type": "private_message",
+                        "session_type": 1,
+                        "session_id": "u_1001",
+                        "msg_id": "56",
+                        "sender_id": "u_8",
+                        "sender_name": "alice",
+                        "content": "hello",
+                    },
+                }
+            )
+        )
+
+        await _wait_for(lambda: len(fake_client.acknowledged_events) == 1)
+        await _wait_for(lambda: fake_client.bind_started.is_set())
+        await _wait_for(lambda: len(seen_events) == 1)
+        await _wait_for(lambda: len(fake_client.sent) == 1)
+        await _wait_for(lambda: len(fake_client.completed_events) == 1)
+
+        assert fake_client.acknowledged_events[0]["event_id"] == "evt-2"
+        assert fake_client.bound_routes[0]["session_id"] == "u_1001"
+
+        fake_client.release_bind.set()
+        await packet_task
+        await adapter.cancel_background_tasks()
 
     @pytest.mark.asyncio
     async def test_event_stop_dispatches_stop_command(self):
