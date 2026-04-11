@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, Optional
 
 from gateway.config import Platform, PlatformConfig
@@ -63,6 +64,8 @@ MAX_TEXT_LENGTH = 4000
 _EXEC_APPROVAL_HOST = "Hermes Grix"
 _EXEC_APPROVAL_TIMEOUT_SEC = 300
 _ROUTE_SESSION_KEY_PREFIX = "agent:main:grix:"
+_EVENT_DEDUP_WINDOW_SECONDS = 300
+_EVENT_DEDUP_MAX_SIZE = 1000
 _STRIP_MARKDOWN_REPLACEMENTS = (
     (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),
     (re.compile(r"\*(.+?)\*", re.DOTALL), r"\1"),
@@ -310,6 +313,9 @@ class GrixAdapter(BasePlatformAdapter):
         self._disconnect_requested = False
         self._token_lock_identity: Optional[str] = None
         self._completed_event_ids: set[str] = set()
+        self._seen_event_ids: Dict[str, float] = {}
+        self._completed_event_results: Dict[str, Dict[str, Optional[str]]] = {}
+        self._completed_stop_results: Dict[str, Dict[str, Optional[str]]] = {}
         self._reply_event_ids: Dict[tuple[str, str], str] = {}
         self._latest_sources: Dict[str, Any] = {}
         self._message_sources: Dict[tuple[str, str], Any] = {}
@@ -383,6 +389,10 @@ class GrixAdapter(BasePlatformAdapter):
                 await client.disconnect("adapter disconnect")
             except Exception as exc:
                 logger.debug("[%s] GRIX disconnect failed: %s", self.name, exc)
+        self._seen_event_ids.clear()
+        self._completed_event_results.clear()
+        self._completed_stop_results.clear()
+        self._completed_event_ids.clear()
         await self._safe_release_lock()
         self._mark_disconnected()
 
@@ -703,6 +713,18 @@ class GrixAdapter(BasePlatformAdapter):
         self._message_sources[(message.session_id, message.message_id)] = source
         self._message_session_keys[(message.session_id, message.message_id)] = session_key
 
+        is_duplicate = self._remember_event_id(message.event_id)
+        if is_duplicate:
+            if self._client:
+                await self._client.acknowledge_event(
+                    event_id=message.event_id,
+                    session_id=message.session_id,
+                    message_id=message.message_id,
+                )
+                await self._replay_completed_event(message.event_id)
+            logger.debug("[%s] Ignoring duplicate GRIX message event %s", self.name, message.event_id)
+            return
+
         if self._client:
             try:
                 await self._client.bind_session_route(
@@ -816,6 +838,18 @@ class GrixAdapter(BasePlatformAdapter):
         )
         was_active = session_key in self._active_sessions
 
+        is_duplicate = self._remember_event_id(stop.event_id)
+        if is_duplicate:
+            if self._client:
+                await self._client.acknowledge_stop(
+                    event_id=stop.event_id,
+                    stop_id=stop.stop_id,
+                    accepted=True,
+                )
+                await self._replay_completed_stop(stop.event_id, stop.stop_id)
+            logger.debug("[%s] Ignoring duplicate GRIX stop event %s", self.name, stop.event_id)
+            return
+
         if self._client:
             await self._client.acknowledge_stop(
                 event_id=stop.event_id,
@@ -834,14 +868,14 @@ class GrixAdapter(BasePlatformAdapter):
         try:
             await self.handle_message(event)
             if self._client:
-                await self._client.complete_stop(
+                await self._complete_stop(
                     event_id=stop.event_id,
                     stop_id=stop.stop_id,
                     status=STATUS_STOPPED if was_active else STATUS_ALREADY_FINISHED,
                 )
         except Exception as exc:
             if self._client:
-                await self._client.complete_stop(
+                await self._complete_stop(
                     event_id=stop.event_id,
                     stop_id=stop.stop_id,
                     status=STATUS_FAILED,
@@ -882,7 +916,93 @@ class GrixAdapter(BasePlatformAdapter):
                 exc,
             )
             return
+        self._completed_event_results[event_id] = {
+            "status": status,
+            "message": message,
+        }
         self._completed_event_ids.add(event_id)
+
+    async def _complete_stop(
+        self,
+        *,
+        event_id: str,
+        stop_id: Optional[str],
+        status: str,
+        code: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        if not self._client or not event_id:
+            return
+        await self._client.complete_stop(
+            event_id=event_id,
+            stop_id=stop_id,
+            status=status,
+            code=code,
+            message=message,
+        )
+        self._completed_stop_results[event_id] = {
+            "status": status,
+            "stop_id": stop_id,
+            "code": code,
+            "message": message,
+        }
+
+    async def _replay_completed_event(self, event_id: str) -> None:
+        if not self._client:
+            return
+        result = self._completed_event_results.get(event_id)
+        if not result:
+            return
+        await self._client.complete_event(
+            event_id=event_id,
+            status=str(result.get("status") or STATUS_RESPONDED),
+            message=result.get("message"),
+        )
+
+    async def _replay_completed_stop(self, event_id: str, stop_id: Optional[str]) -> None:
+        if not self._client:
+            return
+        result = self._completed_stop_results.get(event_id)
+        if not result:
+            return
+        await self._client.complete_stop(
+            event_id=event_id,
+            stop_id=stop_id or result.get("stop_id"),
+            status=str(result.get("status") or STATUS_ALREADY_FINISHED),
+            code=result.get("code"),
+            message=result.get("message"),
+        )
+
+    def _remember_event_id(self, event_id: str) -> bool:
+        normalized_event_id = str(event_id or "").strip()
+        if not normalized_event_id:
+            return False
+
+        now = time.time()
+        if len(self._seen_event_ids) > _EVENT_DEDUP_MAX_SIZE:
+            cutoff = now - _EVENT_DEDUP_WINDOW_SECONDS
+            self._seen_event_ids = {
+                key: ts for key, ts in self._seen_event_ids.items() if ts > cutoff
+            }
+            self._completed_event_results = {
+                key: value
+                for key, value in self._completed_event_results.items()
+                if key in self._seen_event_ids
+            }
+            self._completed_stop_results = {
+                key: value
+                for key, value in self._completed_stop_results.items()
+                if key in self._seen_event_ids
+            }
+            self._completed_event_ids = {
+                key for key in self._completed_event_ids if key in self._seen_event_ids
+            }
+
+        if normalized_event_id in self._seen_event_ids:
+            return True
+
+        self._seen_event_ids[normalized_event_id] = now
+        return False
 
     async def _safe_release_lock(self) -> None:
         if not self._token_lock_identity:

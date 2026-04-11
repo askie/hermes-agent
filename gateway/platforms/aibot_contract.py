@@ -1,12 +1,14 @@
 """Canonical definitions for the standard AIBOT protocol.
 
 This module is the single source of truth for public AIBOT command names,
-status values, error codes, and capability declarations. Platform adapters may
-bridge legacy transports internally, but they should converge on these values
-when implementing the standard contract.
+status values, error codes, capabilities, and the frozen v1 baseline. Platform
+adapters may bridge legacy transports internally, but they should converge on
+these values when implementing the standard contract.
 """
 
 from __future__ import annotations
+
+from typing import Any, Dict
 
 AIBOT_PROTOCOL_VERSION = "aibot-agent-api-v1"
 AIBOT_DEFAULT_CONTRACT_VERSION = 1
@@ -34,6 +36,47 @@ CMD_EVENT_EDIT = "event_edit"
 CMD_EVENT_REVOKE = "event_revoke"
 CMD_SESSION_ROUTE_BIND = "session_route_bind"
 CMD_SESSION_ROUTE_RESOLVE = "session_route_resolve"
+
+STABLE_PUBLIC_COMMANDS = (
+    {"cmd": CMD_AUTH, "direction": "client_to_server", "purpose": "authenticate"},
+    {"cmd": CMD_AUTH_ACK, "direction": "server_to_client", "purpose": "authentication_result"},
+    {"cmd": CMD_PING, "direction": "bidirectional", "purpose": "keepalive_request"},
+    {"cmd": CMD_PONG, "direction": "bidirectional", "purpose": "keepalive_response"},
+    {"cmd": CMD_EVENT_MSG, "direction": "server_to_client", "purpose": "message_event"},
+    {"cmd": CMD_EVENT_ACK, "direction": "client_to_server", "purpose": "message_event_received"},
+    {"cmd": CMD_EVENT_RESULT, "direction": "client_to_server", "purpose": "message_event_completed"},
+    {"cmd": CMD_EVENT_STOP, "direction": "server_to_client", "purpose": "stop_event"},
+    {"cmd": CMD_EVENT_STOP_ACK, "direction": "client_to_server", "purpose": "stop_event_received"},
+    {"cmd": CMD_EVENT_STOP_RESULT, "direction": "client_to_server", "purpose": "stop_event_completed"},
+    {"cmd": CMD_EVENT_EDIT, "direction": "server_to_client", "purpose": "message_edit_event"},
+    {"cmd": CMD_EVENT_REVOKE, "direction": "server_to_client", "purpose": "message_revoke_event"},
+    {"cmd": CMD_SEND_MSG, "direction": "client_to_server", "purpose": "send_message"},
+    {"cmd": CMD_SEND_ACK, "direction": "server_to_client", "purpose": "send_succeeded"},
+    {"cmd": CMD_SEND_NACK, "direction": "server_to_client", "purpose": "send_failed"},
+    {"cmd": CMD_EDIT_MSG, "direction": "client_to_server", "purpose": "edit_message"},
+    {
+        "cmd": CMD_SESSION_ACTIVITY_SET,
+        "direction": "client_to_server",
+        "purpose": "session_activity_update",
+    },
+    {"cmd": CMD_LOCAL_ACTION, "direction": "server_to_client", "purpose": "local_action_request"},
+    {
+        "cmd": CMD_LOCAL_ACTION_RESULT,
+        "direction": "client_to_server",
+        "purpose": "local_action_result",
+    },
+    {
+        "cmd": CMD_SESSION_ROUTE_BIND,
+        "direction": "client_to_server",
+        "purpose": "bind_session_route",
+    },
+    {
+        "cmd": CMD_SESSION_ROUTE_RESOLVE,
+        "direction": "client_to_server",
+        "purpose": "resolve_session_route",
+    },
+    {"cmd": CMD_ERROR, "direction": "bidirectional", "purpose": "generic_error"},
+)
 
 # Capabilities
 CAP_SESSION_ROUTE = "session_route"
@@ -65,6 +108,21 @@ STATUS_RESPONDED = "responded"
 STATUS_STOPPED = "stopped"
 STATUS_ALREADY_FINISHED = "already_finished"
 
+STABLE_EVENT_RESULT_STATUSES = (
+    STATUS_RESPONDED,
+    STATUS_FAILED,
+)
+STABLE_EVENT_STOP_RESULT_STATUSES = (
+    STATUS_STOPPED,
+    STATUS_ALREADY_FINISHED,
+    STATUS_FAILED,
+)
+STABLE_LOCAL_ACTION_RESULT_STATUSES = (
+    STATUS_OK,
+    STATUS_FAILED,
+    STATUS_UNSUPPORTED,
+)
+
 # Error codes
 ERR_INVALID_LOCAL_ACTION = "invalid_local_action"
 ERR_UNSUPPORTED_LOCAL_ACTION = "unsupported_local_action"
@@ -73,3 +131,88 @@ ERR_UNSUPPORTED_DECISION = "unsupported_decision"
 ERR_APPROVAL_NOT_FOUND = "approval_not_found"
 ERR_STOP_HANDLER_FAILED = "stop_handler_failed"
 
+STABLE_ERROR_CODES = (
+    ERR_INVALID_LOCAL_ACTION,
+    ERR_UNSUPPORTED_LOCAL_ACTION,
+    ERR_MISSING_APPROVAL_ID,
+    ERR_UNSUPPORTED_DECISION,
+    ERR_APPROVAL_NOT_FOUND,
+    ERR_STOP_HANDLER_FAILED,
+)
+
+STABLE_PACKET_FIELDS = ("cmd", "seq", "payload")
+REQUIRED_AUTH_FIELDS = ("agent_id", "api_key", "protocol_version", "contract_version")
+FORBIDDEN_PUBLIC_FIELDS = (
+    "chatid",
+    "req_id",
+    "markdown",
+    "stream",
+    "media_id",
+    "upload_id",
+)
+RECOMMENDED_PUBLIC_FIELDS = (
+    "agent_id",
+    "session_id",
+    "event_id",
+    "msg_id",
+    "thread_id",
+    "route_session_key",
+    "content",
+    "quoted_message_id",
+    "attachments",
+    "mention_user_ids",
+    "status",
+    "code",
+    "msg",
+    "error_code",
+    "error_msg",
+)
+MINIMAL_PLUGIN_SURFACE = (
+    CMD_AUTH,
+    CMD_PING,
+    CMD_PONG,
+    CMD_EVENT_MSG,
+    CMD_EVENT_ACK,
+    CMD_EVENT_RESULT,
+    CMD_EVENT_STOP,
+    CMD_EVENT_STOP_ACK,
+    CMD_EVENT_STOP_RESULT,
+    CMD_SEND_MSG,
+    CMD_SEND_ACK,
+    CMD_SEND_NACK,
+    CMD_EDIT_MSG,
+    CMD_LOCAL_ACTION,
+    CMD_LOCAL_ACTION_RESULT,
+    CMD_SESSION_ROUTE_BIND,
+    CMD_SESSION_ROUTE_RESOLVE,
+)
+
+
+def public_command_names() -> tuple[str, ...]:
+    return tuple(entry["cmd"] for entry in STABLE_PUBLIC_COMMANDS)
+
+
+def build_public_contract_manifest() -> Dict[str, Any]:
+    """Return the frozen public v1 baseline as a JSON-serializable dict."""
+
+    return {
+        "protocol_version": AIBOT_PROTOCOL_VERSION,
+        "contract_version": AIBOT_DEFAULT_CONTRACT_VERSION,
+        "packet_fields": list(STABLE_PACKET_FIELDS),
+        "public_commands": [dict(entry) for entry in STABLE_PUBLIC_COMMANDS],
+        "required_auth_fields": list(REQUIRED_AUTH_FIELDS),
+        "capabilities": {
+            "required": list(REQUIRED_AUTH_CAPABILITIES),
+            "stable": list(STABLE_AUTH_CAPABILITIES),
+        },
+        "local_actions": list(STABLE_LOCAL_ACTIONS),
+        "statuses": {
+            "event_result": list(STABLE_EVENT_RESULT_STATUSES),
+            "event_stop_result": list(STABLE_EVENT_STOP_RESULT_STATUSES),
+            "local_action_result": list(STABLE_LOCAL_ACTION_RESULT_STATUSES),
+        },
+        "error_codes": list(STABLE_ERROR_CODES),
+        "forbidden_public_fields": list(FORBIDDEN_PUBLIC_FIELDS),
+        "recommended_public_fields": list(RECOMMENDED_PUBLIC_FIELDS),
+        "minimal_plugin_surface": list(MINIMAL_PLUGIN_SURFACE),
+    }

@@ -638,6 +638,32 @@ class TestInboundMessages:
         await adapter._on_message(payload)
         adapter.handle_message.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_on_message_ignores_duplicate_msgid(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "msg-dup-1",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "hello"},
+            },
+        }
+
+        await adapter._on_message(payload)
+        await adapter._on_message(payload)
+
+        adapter.handle_message.assert_awaited_once()
+
 
 class TestPlatformEnum:
     def test_wecom_in_platform_enum(self):

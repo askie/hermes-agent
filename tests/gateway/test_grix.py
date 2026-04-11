@@ -21,6 +21,7 @@ from gateway.platforms.aibot_contract import (
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
     STATUS_RESPONDED,
+    STATUS_STOPPED,
     ERR_APPROVAL_NOT_FOUND,
     ERR_UNSUPPORTED_LOCAL_ACTION,
 )
@@ -460,6 +461,103 @@ class TestGrixAdapter:
         assert seen_commands == ["/stop"]
         assert fake_client.acknowledged_stops[0]["event_id"] == "stop-1"
         assert fake_client.completed_stops[0]["status"] == "stopped"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_event_msg_is_acknowledged_without_duplicate_delivery(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        seen_events = []
+
+        async def handler(event):
+            seen_events.append(event.text)
+            return "hello back"
+
+        adapter.set_message_handler(handler)
+        packet = {
+            "cmd": "event_msg",
+            "seq": 0,
+            "payload": {
+                "event_id": "evt-dup-1",
+                "event_type": "group_message",
+                "session_type": 2,
+                "session_id": "g_1001",
+                "thread_id": "topic-a",
+                "msg_id": "55",
+                "sender_id": "u_8",
+                "sender_name": "alice",
+                "content": "hello",
+            },
+        }
+
+        await adapter._handle_protocol_packet(packet)
+        await _wait_for(lambda: len(fake_client.sent) == 1)
+        await _wait_for(lambda: len(fake_client.completed_events) == 1)
+
+        await adapter._handle_protocol_packet(packet)
+
+        assert seen_events == ["hello"]
+        assert len(fake_client.sent) == 1
+        assert len(fake_client.bound_routes) == 1
+        assert len(fake_client.acknowledged_events) == 2
+        assert len(fake_client.completed_events) == 2
+        assert fake_client.completed_events[1]["status"] == STATUS_RESPONDED
+
+    @pytest.mark.asyncio
+    async def test_duplicate_event_stop_replays_completion_without_duplicate_command(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+        source = adapter.build_source(
+            chat_id="g_1001",
+            chat_type="group",
+            user_id="u_8",
+            user_name="alice",
+            thread_id="topic-a",
+        )
+        session_key = build_session_key(source)
+        adapter._latest_sources["g_1001"] = source
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        seen_commands = []
+
+        async def handler(event):
+            seen_commands.append(event.text)
+            return "stopped"
+
+        adapter.set_message_handler(handler)
+        packet = {
+            "cmd": "event_stop",
+            "seq": 0,
+            "payload": {
+                "event_id": "stop-dup-1",
+                "session_id": "g_1001",
+                "reason": "user_stop",
+                "stop_id": "stop-token-1",
+            },
+        }
+
+        await adapter._handle_protocol_packet(packet)
+        await adapter._handle_protocol_packet(packet)
+
+        assert seen_commands == ["/stop"]
+        assert len(fake_client.acknowledged_stops) == 2
+        assert len(fake_client.completed_stops) == 2
+        assert fake_client.completed_stops[0]["status"] == STATUS_STOPPED
+        assert fake_client.completed_stops[1]["status"] == STATUS_STOPPED
 
     @pytest.mark.asyncio
     async def test_send_resolves_bound_route_session_key(self):
