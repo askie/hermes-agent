@@ -325,6 +325,30 @@ class GrixAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         return _strip_markdown(content)
 
+    def _schedule_session_route_bind(self, *, session_key: str, session_id: str) -> None:
+        client = self._client
+        if not client:
+            return
+
+        async def _bind_route() -> None:
+            try:
+                await client.bind_session_route(
+                    channel=self.platform.value,
+                    account_id=self.connection.account_id,
+                    route_session_key=session_key,
+                    session_id=session_id,
+                )
+            except Exception as exc:
+                logger.debug("[%s] GRIX session_route_bind failed: %s", self.name, exc)
+
+        task = asyncio.create_task(_bind_route())
+        try:
+            self._background_tasks.add(task)
+        except TypeError:
+            return
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
+
     async def connect(self) -> bool:
         if not self.connection.endpoint or not self.connection.agent_id or not self.connection.api_key:
             logger.error("[%s] Missing GRIX_ENDPOINT, GRIX_AGENT_ID, or GRIX_API_KEY", self.name)
@@ -726,19 +750,14 @@ class GrixAdapter(BasePlatformAdapter):
             return
 
         if self._client:
-            try:
-                await self._client.bind_session_route(
-                    channel=self.platform.value,
-                    account_id=self.connection.account_id,
-                    route_session_key=session_key,
-                    session_id=message.session_id,
-                )
-            except Exception as exc:
-                logger.debug("[%s] GRIX session_route_bind failed: %s", self.name, exc)
             await self._client.acknowledge_event(
                 event_id=message.event_id,
                 session_id=message.session_id,
                 message_id=message.message_id,
+            )
+            self._schedule_session_route_bind(
+                session_key=session_key,
+                session_id=message.session_id,
             )
 
         event = MessageEvent(
