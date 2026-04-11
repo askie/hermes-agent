@@ -309,6 +309,12 @@ def has_blocking_approval(session_key: str) -> bool:
         return bool(_gateway_queues.get(session_key))
 
 
+def pending_approval_count(session_key: str) -> int:
+    """Return the number of pending gateway approvals for a session."""
+    with _lock:
+        return len(_gateway_queues.get(session_key, ()))
+
+
 def submit_pending(session_key: str, approval: dict):
     """Store a pending approval request for a session."""
     with _lock:
