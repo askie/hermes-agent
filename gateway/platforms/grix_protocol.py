@@ -6,7 +6,14 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
-PROTOCOL_VERSION = "aibot-agent-api-v1"
+from gateway.platforms.aibot_contract import (
+    AIBOT_DEFAULT_CONTRACT_VERSION,
+    AIBOT_PROTOCOL_VERSION,
+    REQUIRED_AUTH_CAPABILITIES,
+    STABLE_AUTH_CAPABILITIES,
+    STABLE_LOCAL_ACTIONS,
+)
+
 DEFAULT_HEARTBEAT_SEC = 30
 DEFAULT_CONNECT_TIMEOUT_MS = 10_000
 DEFAULT_REQUEST_TIMEOUT_MS = 20_000
@@ -14,18 +21,8 @@ DEFAULT_CLIENT = "hermes-agent"
 DEFAULT_CLIENT_TYPE = "hermes"
 DEFAULT_CLIENT_VERSION = "0.8.0"
 DEFAULT_HOST_TYPE = "hermes"
-DEFAULT_CONTRACT_VERSION = 1
-REQUIRED_AUTH_CAPABILITIES = ("local_action_v1",)
-STABLE_AUTH_CAPABILITIES = (
-    "session_route",
-    "thread_v1",
-    "inbound_media_v1",
-    "local_action_v1",
-)
-STABLE_LOCAL_ACTIONS = (
-    "exec_approve",
-    "exec_reject",
-)
+DEFAULT_CONTRACT_VERSION = AIBOT_DEFAULT_CONTRACT_VERSION
+PROTOCOL_VERSION = AIBOT_PROTOCOL_VERSION
 
 
 def clamp_int(value: Any, fallback: int, minimum: int, maximum: int) -> int:

@@ -9,6 +9,25 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional, Protocol
 
+from gateway.platforms.aibot_contract import (
+    CMD_AUTH,
+    CMD_AUTH_ACK,
+    CMD_EDIT_MSG,
+    CMD_ERROR,
+    CMD_EVENT_ACK,
+    CMD_EVENT_RESULT,
+    CMD_EVENT_STOP_ACK,
+    CMD_EVENT_STOP_RESULT,
+    CMD_LOCAL_ACTION_RESULT,
+    CMD_PING,
+    CMD_PONG,
+    CMD_SEND_ACK,
+    CMD_SEND_MSG,
+    CMD_SEND_NACK,
+    CMD_SESSION_ACTIVITY_SET,
+    CMD_SESSION_ROUTE_BIND,
+    CMD_SESSION_ROUTE_RESOLVE,
+)
 from gateway.platforms.grix_protocol import (
     DEFAULT_REQUEST_TIMEOUT_MS,
     GrixConnectionConfig,
@@ -249,9 +268,9 @@ class GrixTransportClient:
 
     async def authenticate(self) -> GrixAuthSession:
         packet = await self.request(
-            "auth",
+            CMD_AUTH,
             build_auth_payload(self._config),
-            expected=("auth_ack",),
+            expected=(CMD_AUTH_ACK,),
             timeout_ms=10_000,
             require_authed=False,
         )
@@ -350,12 +369,12 @@ class GrixTransportClient:
             payload["event_id"] = event_id.strip()
 
         packet = await self.request(
-            "send_msg",
+            CMD_SEND_MSG,
             payload,
-            expected=("send_ack", "send_nack", "error"),
+            expected=(CMD_SEND_ACK, CMD_SEND_NACK, CMD_ERROR),
             timeout_ms=timeout_ms,
         )
-        if packet["cmd"] != "send_ack":
+        if packet["cmd"] != CMD_SEND_ACK:
             raise self._packet_error(packet)
         return {
             "ok": True,
@@ -375,16 +394,16 @@ class GrixTransportClient:
         timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         packet = await self.request(
-            "edit_msg",
+            CMD_EDIT_MSG,
             {
                 "session_id": session_id.strip(),
                 "msg_id": message_id.strip(),
                 "content": text,
             },
-            expected=("send_ack", "send_nack", "error"),
+            expected=(CMD_SEND_ACK, CMD_SEND_NACK, CMD_ERROR),
             timeout_ms=timeout_ms,
         )
-        if packet["cmd"] != "send_ack":
+        if packet["cmd"] != CMD_SEND_ACK:
             raise self._packet_error(packet)
         return {
             "ok": True,
@@ -414,7 +433,7 @@ class GrixTransportClient:
             payload["ref_msg_id"] = ref_message_id.strip()
         if ref_event_id:
             payload["ref_event_id"] = ref_event_id.strip()
-        await self.send_packet("session_activity_set", payload)
+        await self.send_packet(CMD_SESSION_ACTIVITY_SET, payload)
 
     async def send_local_action_result(
         self,
@@ -435,7 +454,7 @@ class GrixTransportClient:
             payload["error_code"] = error_code.strip()
         if error_message:
             payload["error_msg"] = error_message.strip()
-        await self.send_packet("local_action_result", payload)
+        await self.send_packet(CMD_LOCAL_ACTION_RESULT, payload)
 
     async def acknowledge_event(
         self,
@@ -453,7 +472,7 @@ class GrixTransportClient:
             payload["session_id"] = session_id.strip()
         if message_id:
             payload["msg_id"] = message_id.strip()
-        await self.send_packet("event_ack", payload)
+        await self.send_packet(CMD_EVENT_ACK, payload)
 
     async def complete_event(
         self,
@@ -473,7 +492,7 @@ class GrixTransportClient:
             payload["code"] = code.strip()
         if message:
             payload["msg"] = message.strip()
-        await self.send_packet("event_result", payload)
+        await self.send_packet(CMD_EVENT_RESULT, payload)
 
     async def acknowledge_stop(
         self,
@@ -490,7 +509,7 @@ class GrixTransportClient:
         }
         if stop_id:
             payload["stop_id"] = stop_id.strip()
-        await self.send_packet("event_stop_ack", payload)
+        await self.send_packet(CMD_EVENT_STOP_ACK, payload)
 
     async def complete_stop(
         self,
@@ -513,7 +532,7 @@ class GrixTransportClient:
             payload["code"] = code.strip()
         if message:
             payload["msg"] = message.strip()
-        await self.send_packet("event_stop_result", payload)
+        await self.send_packet(CMD_EVENT_STOP_RESULT, payload)
 
     async def bind_session_route(
         self,
@@ -525,17 +544,17 @@ class GrixTransportClient:
         timeout_ms: Optional[int] = None,
     ) -> None:
         packet = await self.request(
-            "session_route_bind",
+            CMD_SESSION_ROUTE_BIND,
             {
                 "channel": channel.strip(),
                 "account_id": account_id.strip(),
                 "route_session_key": route_session_key.strip(),
                 "session_id": session_id.strip(),
             },
-            expected=("send_ack", "send_nack", "error"),
+            expected=(CMD_SEND_ACK, CMD_SEND_NACK, CMD_ERROR),
             timeout_ms=timeout_ms,
         )
-        if packet["cmd"] != "send_ack":
+        if packet["cmd"] != CMD_SEND_ACK:
             raise self._packet_error(packet)
 
     async def resolve_session_route(
@@ -547,16 +566,16 @@ class GrixTransportClient:
         timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         packet = await self.request(
-            "session_route_resolve",
+            CMD_SESSION_ROUTE_RESOLVE,
             {
                 "channel": channel.strip(),
                 "account_id": account_id.strip(),
                 "route_session_key": route_session_key.strip(),
             },
-            expected=("send_ack", "send_nack", "error"),
+            expected=(CMD_SEND_ACK, CMD_SEND_NACK, CMD_ERROR),
             timeout_ms=timeout_ms,
         )
-        if packet["cmd"] != "send_ack":
+        if packet["cmd"] != CMD_SEND_ACK:
             raise self._packet_error(packet)
 
         session_id = str(packet["payload"].get("session_id") or "").strip()
@@ -591,9 +610,9 @@ class GrixTransportClient:
         if not text:
             return
         packet = decode_packet(text)
-        if packet["cmd"] == "ping":
+        if packet["cmd"] == CMD_PING:
             await self._send_packet_internal(
-                "pong",
+                CMD_PONG,
                 {"ts": _now_ms()},
                 seq=packet["seq"] if packet["seq"] > 0 else None,
                 require_authed=False,
