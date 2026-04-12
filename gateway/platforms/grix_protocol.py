@@ -13,6 +13,7 @@ from gateway.platforms.aibot_contract import (
     STABLE_AUTH_CAPABILITIES,
     STABLE_LOCAL_ACTIONS,
 )
+from gateway.platforms.card_actions import sanitize_card_action_tag
 
 DEFAULT_HEARTBEAT_SEC = 30
 DEFAULT_CONNECT_TIMEOUT_MS = 10_000
@@ -23,6 +24,32 @@ DEFAULT_CLIENT_VERSION = "0.8.0"
 DEFAULT_HOST_TYPE = "hermes"
 DEFAULT_CONTRACT_VERSION = AIBOT_DEFAULT_CONTRACT_VERSION
 PROTOCOL_VERSION = AIBOT_PROTOCOL_VERSION
+MAX_INTERACTIVE_CONTENT_BYTES = 32_768
+_CARD_ACTION_KEYS = (
+    "card_action",
+    "interactive_action",
+    "action",
+    "callback_action",
+    "callback",
+)
+_CARD_ACTION_TAG_KEYS = (
+    "tag",
+    "action_tag",
+    "action_type",
+    "action",
+    "type",
+    "name",
+    "key",
+)
+_CARD_ACTION_VALUE_KEYS = (
+    "value",
+    "params",
+    "payload",
+    "data",
+    "input",
+    "state",
+    "form_data",
+)
 
 
 def clamp_int(value: Any, fallback: int, minimum: int, maximum: int) -> int:
@@ -162,6 +189,9 @@ class GrixInboundMessage:
     chat_type: str
     text: str
     message_id: str
+    content_type: str = "text"
+    card_action_tag: Optional[str] = None
+    card_action_value: Any = None
     event_type: Optional[str] = None
     session_type: Optional[int] = None
     chat_name: Optional[str] = None
@@ -363,6 +393,152 @@ def normalize_object(value: Any) -> Optional[Dict[str, Any]]:
     return dict(value)
 
 
+def normalize_message_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return ""
+
+
+def _load_structured_content(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return None
+
+    trimmed = value.strip()
+    if (
+        len(trimmed.encode("utf-8")) > MAX_INTERACTIVE_CONTENT_BYTES
+        or not trimmed.startswith(("{", "["))
+    ):
+        return None
+
+    try:
+        parsed = json.loads(trimmed)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, (dict, list)) else None
+
+
+def _dict_has_card_hint(value: Optional[Dict[str, Any]]) -> bool:
+    if not value:
+        return False
+
+    for key in value:
+        lowered = normalize_text(key).lower()
+        if "card" in lowered or "interactive" in lowered or lowered in {"action", "callback"}:
+            return True
+
+    for meta_key in ("type", "kind", "event"):
+        lowered = normalize_text(value.get(meta_key)).lower()
+        if "card" in lowered or "interactive" in lowered or "action" in lowered:
+            return True
+    return False
+
+
+def _extract_action_tag(value: Dict[str, Any]) -> str:
+    for key in _CARD_ACTION_TAG_KEYS:
+        tag = normalize_text(value.get(key))
+        if tag:
+            return sanitize_card_action_tag(tag)
+    return "button"
+
+
+def _extract_action_value(value: Dict[str, Any]) -> Any:
+    for key in _CARD_ACTION_VALUE_KEYS:
+        if key in value:
+            return value.get(key)
+    return None
+
+
+def _normalize_card_action_candidate(candidate: Any, *, fallback_value: Any = None) -> Optional[tuple[str, Any]]:
+    if isinstance(candidate, dict):
+        has_tag = any(normalize_text(candidate.get(key)) for key in _CARD_ACTION_TAG_KEYS)
+        action_value = _extract_action_value(candidate)
+        if action_value is None and fallback_value is not None and fallback_value is not candidate:
+            if isinstance(fallback_value, dict):
+                nested_value = _extract_action_value(fallback_value)
+                if nested_value is not None:
+                    action_value = nested_value
+            if action_value is None:
+                action_value = fallback_value
+        if action_value is None and not has_tag:
+            return None
+        return _extract_action_tag(candidate), action_value
+
+    if fallback_value is not None and candidate is fallback_value:
+        return "button", fallback_value
+
+    if candidate in (None, ""):
+        return None
+    return "button", candidate
+
+
+def _iter_card_action_candidates(
+    payload: Dict[str, Any],
+    *,
+    biz_card: Optional[Dict[str, Any]],
+    channel_data: Optional[Dict[str, Any]],
+    structured_content: Any,
+):
+    for container in (payload, channel_data or {}, biz_card or {}):
+        if not isinstance(container, dict):
+            continue
+        for key in _CARD_ACTION_KEYS:
+            if key in container:
+                yield container.get(key)
+
+    if isinstance(structured_content, dict):
+        if any(key in structured_content for key in _CARD_ACTION_VALUE_KEYS):
+            yield structured_content
+        elif any(normalize_text(structured_content.get(key)) for key in _CARD_ACTION_TAG_KEYS):
+            yield structured_content
+
+
+def resolve_card_action(
+    payload: Dict[str, Any],
+    *,
+    biz_card: Optional[Dict[str, Any]],
+    channel_data: Optional[Dict[str, Any]],
+    content_value: Any,
+) -> tuple[Optional[str], Any, bool]:
+    structured_content = _load_structured_content(content_value)
+
+    for candidate in _iter_card_action_candidates(
+        payload,
+        biz_card=biz_card,
+        channel_data=channel_data,
+        structured_content=structured_content,
+    ):
+        resolved = _normalize_card_action_candidate(candidate, fallback_value=structured_content)
+        if resolved is not None:
+            return resolved[0], resolved[1], True
+
+    event_type = normalize_text(payload.get("event_type")).lower()
+    has_card_signal = (
+        "card" in event_type
+        or "interactive" in event_type
+        or bool(biz_card)
+        or _dict_has_card_hint(channel_data)
+    )
+    if not has_card_signal:
+        return None, None, False
+
+    fallback_value = structured_content
+    if fallback_value is None:
+        fallback_text = normalize_message_text(content_value)
+        if fallback_text:
+            fallback_value = fallback_text
+    if fallback_value is None:
+        return None, None, True
+    return "button", fallback_value, True
+
+
 def normalize_mentions(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []
@@ -392,6 +568,7 @@ def normalize_inbound_message(payload: Dict[str, Any]) -> GrixInboundMessage:
         raise ValueError("inbound message requires msg_id")
 
     sender_id = normalize_id(payload.get("sender_id"))
+    content_value = payload.get("content")
     attachments = [
         attachment
         for attachment in (
@@ -400,6 +577,21 @@ def normalize_inbound_message(payload: Dict[str, Any]) -> GrixInboundMessage:
         )
         if attachment
     ]
+    biz_card = normalize_object(payload.get("biz_card"))
+    channel_data = normalize_object(payload.get("channel_data"))
+    card_action_tag, card_action_value, has_card_signal = resolve_card_action(
+        payload,
+        biz_card=biz_card,
+        channel_data=channel_data,
+        content_value=content_value,
+    )
+    content_type = "text"
+    text_content = normalize_message_text(content_value)
+    if card_action_tag:
+        content_type = "card_action"
+        text_content = ""
+    elif has_card_signal and not text_content:
+        content_type = "interactive_invalid"
 
     return GrixInboundMessage(
         event_id=event_id,
@@ -407,8 +599,11 @@ def normalize_inbound_message(payload: Dict[str, Any]) -> GrixInboundMessage:
         sender_id=sender_id,
         sender_name=resolve_sender_name(payload, sender_id),
         chat_type=resolve_chat_type(payload),
-        text=str(payload.get("content") or ""),
+        text=text_content,
         message_id=message_id,
+        content_type=content_type,
+        card_action_tag=card_action_tag,
+        card_action_value=card_action_value,
         event_type=normalize_text(payload.get("event_type")).lower() or None,
         session_type=clamp_int(payload.get("session_type"), 0, -999_999, 999_999) or None,
         chat_name=(
@@ -428,8 +623,8 @@ def normalize_inbound_message(payload: Dict[str, Any]) -> GrixInboundMessage:
         thread_label=normalize_text(payload.get("thread_label")) or None,
         mentioned_user_ids=normalize_mentions(payload.get("mention_user_ids")),
         attachments=attachments,
-        biz_card=normalize_object(payload.get("biz_card")),
-        channel_data=normalize_object(payload.get("channel_data")),
+        biz_card=biz_card,
+        channel_data=channel_data,
         raw=dict(payload),
     )
 
@@ -495,7 +690,7 @@ def normalize_edit_event(payload: Dict[str, Any]) -> GrixEditEvent:
         session_id=session_id,
         chat_type=resolve_chat_type(payload),
         message_id=message_id,
-        text=str(payload.get("content") or ""),
+        text=normalize_message_text(payload.get("content")),
         sender_id=normalize_id(payload.get("sender_id")) or None,
         sender_type=clamp_int(payload.get("sender_type"), 0, -999_999, 999_999) or None,
         message_type=clamp_int(payload.get("msg_type"), 0, -999_999, 999_999) or None,

@@ -33,6 +33,7 @@ from gateway.platforms.aibot_contract import (
     STATUS_UNSUPPORTED,
 )
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.card_actions import build_card_action_command
 from gateway.platforms.grix_protocol import (
     GrixConnectionConfig,
     GrixEditEvent,
@@ -61,6 +62,7 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 MAX_TEXT_LENGTH = 4000
+_INVALID_INTERACTIVE_CARD_MESSAGE = "invalid interactive card payload"
 _EXEC_APPROVAL_HOST = "Hermes Grix"
 _EXEC_APPROVAL_TIMEOUT_SEC = 300
 _ROUTE_SESSION_KEY_PREFIX = "agent:main:grix:"
@@ -760,11 +762,41 @@ class GrixAdapter(BasePlatformAdapter):
                 session_id=message.session_id,
             )
 
+        if message.content_type == "interactive_invalid":
+            logger.warning(
+                "[%s] Rejecting malformed GRIX interactive payload for event %s",
+                self.name,
+                message.event_id,
+            )
+            if self._client:
+                await self._complete_event_if_needed(
+                    message.event_id,
+                    status=STATUS_FAILED,
+                    message=_INVALID_INTERACTIVE_CARD_MESSAGE,
+                )
+            return
+
+        event_text = message.text
+        event_message_type = _resolve_message_type(message)
+        raw_kind = "message"
+        raw_message = {**message.raw}
+        if message.content_type == "card_action":
+            event_text = build_card_action_command(
+                message.card_action_tag or "button",
+                message.card_action_value,
+            )
+            event_message_type = MessageType.COMMAND
+            raw_kind = "card_action"
+            raw_message["card_action"] = {
+                "tag": message.card_action_tag or "button",
+                "value": message.card_action_value,
+            }
+
         event = MessageEvent(
-            text=message.text,
-            message_type=_resolve_message_type(message),
+            text=event_text,
+            message_type=event_message_type,
             source=source,
-            raw_message={**message.raw, "_grix_kind": "message"},
+            raw_message={**raw_message, "_grix_kind": raw_kind},
             message_id=message.message_id,
             media_urls=[attachment.url for attachment in message.attachments],
             media_types=[

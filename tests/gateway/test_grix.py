@@ -25,7 +25,7 @@ from gateway.platforms.aibot_contract import (
     ERR_APPROVAL_NOT_FOUND,
     ERR_UNSUPPORTED_LOCAL_ACTION,
 )
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms.grix import GrixAdapter, build_grix_connection_config, check_grix_requirements
 from gateway.platforms.grix_protocol import (
     GrixConnectionConfig,
@@ -428,6 +428,102 @@ class TestGrixAdapter:
         assert fake_client.sent[0]["reply_to_message_id"] == "55"
         assert fake_client.sent[0]["text"] == "hello back"
         assert fake_client.completed_events[0]["status"] == STATUS_RESPONDED
+
+    @pytest.mark.asyncio
+    async def test_event_msg_routes_interactive_card_as_synthetic_command(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        seen_events = []
+
+        async def handler(event):
+            seen_events.append(event)
+            return "card received"
+
+        adapter.set_message_handler(handler)
+        await adapter._handle_protocol_packet(
+            {
+                "cmd": "event_msg",
+                "seq": 0,
+                "payload": {
+                    "event_id": "evt-card-1",
+                    "event_type": "interactive_card_action",
+                    "session_type": 2,
+                    "session_id": "g_1001",
+                    "msg_id": "card-55",
+                    "sender_id": "u_8",
+                    "sender_name": "alice",
+                    "content": '{"value":{"choice":"confirm"}}',
+                    "biz_card": {
+                        "card_action": {
+                            "tag": "confirm",
+                        }
+                    },
+                },
+            }
+        )
+
+        await _wait_for(lambda: len(seen_events) == 1)
+        await _wait_for(lambda: len(fake_client.completed_events) == 1)
+
+        assert seen_events[0].message_type == MessageType.COMMAND
+        assert seen_events[0].text == '/card confirm {"choice": "confirm"}'
+        assert seen_events[0].raw_message["_grix_kind"] == "card_action"
+        assert seen_events[0].raw_message["card_action"] == {
+            "tag": "confirm",
+            "value": {"choice": "confirm"},
+        }
+        assert fake_client.completed_events[0]["status"] == STATUS_RESPONDED
+
+    @pytest.mark.asyncio
+    async def test_event_msg_rejects_malformed_interactive_card_payload(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        seen_events = []
+
+        async def handler(event):
+            seen_events.append(event)
+            return None
+
+        adapter.set_message_handler(handler)
+        await adapter._handle_protocol_packet(
+            {
+                "cmd": "event_msg",
+                "seq": 0,
+                "payload": {
+                    "event_id": "evt-card-bad-1",
+                    "event_type": "interactive_card_action",
+                    "session_type": 2,
+                    "session_id": "g_1001",
+                    "msg_id": "card-56",
+                    "sender_id": "u_8",
+                    "sender_name": "alice",
+                    "biz_card": {"kind": "interactive"},
+                },
+            }
+        )
+
+        await _wait_for(lambda: len(fake_client.completed_events) == 1)
+
+        assert seen_events == []
+        assert fake_client.acknowledged_events[0]["event_id"] == "evt-card-bad-1"
+        assert fake_client.completed_events[0]["status"] == "failed"
+        assert fake_client.completed_events[0]["message"] == "invalid interactive card payload"
 
     @pytest.mark.asyncio
     async def test_event_msg_acknowledges_before_route_bind_completes(self):
