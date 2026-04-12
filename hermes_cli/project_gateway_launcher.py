@@ -1,10 +1,9 @@
-"""Start Hermes gateways from this project for the default home or a profile.
+"""Restart Hermes gateways from this project for default or profile homes.
 
-This launcher is intentionally small and focused:
+This launcher stays intentionally small and focused:
 
-- no profile name means the default ``~/.hermes`` gateway
-- a profile name means ``~/.hermes/profiles/<name>``
-- ``--with-default`` starts both the default gateway and the named profile
+- no profile name means restart the default gateway and the paired profile
+- a profile name means restart only ``~/.hermes/profiles/<name>``
 
 It does not reimplement gateway behavior; it only launches the existing
 ``hermes_cli.main gateway run`` entry point with an explicit ``HERMES_HOME``.
@@ -16,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -24,7 +24,11 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+DEFAULT_PROFILE_ENV_VAR = "HERMES_PROJECT_GATEWAY_PROFILE"
+DEFAULT_PROFILE_NAME = "grix-agent"
 START_TIMEOUT_SECONDS = 20.0
+STOP_TIMEOUT_SECONDS = 10.0
+FORCE_KILL_AFTER_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.25
 
 
@@ -59,6 +63,14 @@ def resolve_hermes_home(profile: str | None = None) -> Path:
     return root / "profiles" / validate_profile_name(profile)
 
 
+def get_default_profile_name() -> str:
+    """Return the paired profile used when no explicit target is provided."""
+    configured = str(os.getenv(DEFAULT_PROFILE_ENV_VAR, "")).strip()
+    if configured:
+        return validate_profile_name(configured)
+    return DEFAULT_PROFILE_NAME
+
+
 def _gateway_pid_path(hermes_home: Path) -> Path:
     return hermes_home / "gateway.pid"
 
@@ -69,6 +81,14 @@ def _gateway_state_path(hermes_home: Path) -> Path:
 
 def _launcher_log_path(hermes_home: Path) -> Path:
     return hermes_home / "logs" / "project-gateway-launcher.log"
+
+
+def _remove_runtime_files(hermes_home: Path) -> None:
+    for path in (_gateway_pid_path(hermes_home), _gateway_state_path(hermes_home)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _read_json_file(path: Path) -> dict[str, Any] | None:
@@ -120,6 +140,17 @@ def process_is_running(pid: int | None) -> bool:
 def read_gateway_state(hermes_home: Path) -> dict[str, Any] | None:
     """Read the target gateway runtime state file."""
     return _read_json_file(_gateway_state_path(hermes_home))
+
+
+def read_gateway_runtime_pid(hermes_home: Path) -> int | None:
+    """Read the runtime PID from the PID file, or fall back to runtime state."""
+    pid = read_gateway_pid(hermes_home)
+    if pid is not None:
+        return pid
+
+    state = read_gateway_state(hermes_home) or {}
+    state_pid = state.get("pid")
+    return state_pid if isinstance(state_pid, int) and state_pid > 0 else None
 
 
 def gateway_is_running(hermes_home: Path) -> bool:
@@ -193,21 +224,10 @@ def _target_label(profile: str | None) -> str:
 
 
 def start_gateway(profile: str | None = None) -> dict[str, Any]:
-    """Ensure the target gateway is running and return a small status dict."""
+    """Start the target gateway and return a small status dict."""
     hermes_home = resolve_hermes_home(profile)
     label = _target_label(profile)
     log_path = _launcher_log_path(hermes_home)
-
-    if gateway_is_running(hermes_home):
-        print(f"{label} gateway is already running")
-        print(f"  HERMES_HOME: {hermes_home}")
-        print(f"  Log: {log_path}")
-        return {
-            "label": label,
-            "hermes_home": str(hermes_home),
-            "log_path": str(log_path),
-            "already_running": True,
-        }
 
     pid = _spawn_gateway(hermes_home)
     state = wait_for_gateway_running(hermes_home)
@@ -224,46 +244,112 @@ def start_gateway(profile: str | None = None) -> dict[str, Any]:
         "label": label,
         "hermes_home": str(hermes_home),
         "log_path": str(log_path),
-        "already_running": False,
         "state": state,
     }
 
 
-def build_targets(profile: str | None, with_default: bool) -> list[str | None]:
-    """Return the ordered list of gateway targets to start."""
-    targets: list[str | None] = []
-    if with_default or not profile:
-        targets.append(None)
+def stop_gateway(profile: str | None = None) -> dict[str, Any]:
+    """Stop the target gateway when it is already running."""
+    hermes_home = resolve_hermes_home(profile)
+    label = _target_label(profile)
+    pid = read_gateway_runtime_pid(hermes_home)
+
+    if pid is None or not process_is_running(pid):
+        _remove_runtime_files(hermes_home)
+        return {
+            "label": label,
+            "hermes_home": str(hermes_home),
+            "was_running": False,
+        }
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _remove_runtime_files(hermes_home)
+        return {
+            "label": label,
+            "hermes_home": str(hermes_home),
+            "was_running": False,
+        }
+
+    deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
+    force_deadline = time.monotonic() + FORCE_KILL_AFTER_SECONDS
+    force_sent = False
+
+    while time.monotonic() < deadline:
+        if not process_is_running(pid):
+            _remove_runtime_files(hermes_home)
+            print(f"stopped existing {label} gateway")
+            print(f"  HERMES_HOME: {hermes_home}")
+            return {
+                "label": label,
+                "hermes_home": str(hermes_home),
+                "was_running": True,
+                "pid": pid,
+            }
+
+        if not force_sent and time.monotonic() >= force_deadline:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                _remove_runtime_files(hermes_home)
+                print(f"stopped existing {label} gateway")
+                print(f"  HERMES_HOME: {hermes_home}")
+                return {
+                    "label": label,
+                    "hermes_home": str(hermes_home),
+                    "was_running": True,
+                    "pid": pid,
+                }
+            force_sent = True
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    raise RuntimeError(
+        f"timed out while stopping {label} gateway (HERMES_HOME={hermes_home}, PID={pid})"
+    )
+
+
+def restart_gateways(targets: list[str | None]) -> list[dict[str, Any]]:
+    """Restart every target, stopping all of them before any new start."""
+    normalized_targets: list[str | None] = []
+    for target in targets:
+        normalized_targets.append(None if target is None else validate_profile_name(target))
+
+    for target in normalized_targets:
+        stop_gateway(target)
+
+    results = []
+    for target in normalized_targets:
+        results.append(start_gateway(target))
+    return results
+
+
+def build_targets(profile: str | None) -> list[str | None]:
+    """Return the ordered list of gateway targets to restart."""
     if profile:
-        targets.append(validate_profile_name(profile))
-    return targets
+        return [validate_profile_name(profile)]
+    return [None, get_default_profile_name()]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Start Hermes gateways from the current project for the default "
+            "Restart Hermes gateways from the current project for the default "
             "home or for a named profile."
         )
     )
     parser.add_argument(
         "profile",
         nargs="?",
-        help="Profile name to start. Omit to start the default gateway.",
-    )
-    parser.add_argument(
-        "--with-default",
-        action="store_true",
-        help="When starting a profile, start the default gateway too.",
+        help="Profile name to restart. Omit to restart default and paired gateways.",
     )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    targets = build_targets(args.profile, args.with_default)
-    for target in targets:
-        start_gateway(target)
+    restart_gateways(build_targets(args.profile))
     return 0
 
 
