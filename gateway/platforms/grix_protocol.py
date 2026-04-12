@@ -195,6 +195,7 @@ class GrixInboundMessage:
     chat_type: str
     text: str
     message_id: str
+    mirror_mode: Optional[str] = None
     content_type: str = "text"
     card_action_tag: Optional[str] = None
     card_action_value: Any = None
@@ -617,6 +618,7 @@ def normalize_inbound_message(payload: Dict[str, Any]) -> GrixInboundMessage:
         chat_type=resolve_chat_type(payload),
         text=text_content,
         message_id=message_id,
+        mirror_mode=normalize_text(payload.get("mirror_mode")).lower() or None,
         content_type=content_type,
         card_action_tag=card_action_tag,
         card_action_value=card_action_value,

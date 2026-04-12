@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -20,12 +21,13 @@ from gateway.platforms.aibot_contract import (
     CMD_SESSION_ROUTE_BIND,
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
+    STATUS_FAILED,
     STATUS_RESPONDED,
     STATUS_STOPPED,
     ERR_APPROVAL_NOT_FOUND,
     ERR_UNSUPPORTED_LOCAL_ACTION,
 )
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.grix import GrixAdapter, build_grix_connection_config, check_grix_requirements
 from gateway.platforms.grix_protocol import (
     GrixConnectionConfig,
@@ -163,6 +165,27 @@ class SlowBindProtocolClient(FakeProtocolClient):
         self.bound_routes.append(kwargs)
         self.bind_started.set()
         await self.release_bind.wait()
+
+
+class FakeSessionStore:
+    def __init__(self, session_id: str = "sess-1", session_key: str = "agent:main:grix:group:g_1001:topic-a"):
+        self.session_id = session_id
+        self.session_key = session_key
+        self.appended = []
+        self.sources = []
+
+    def get_or_create_session(self, source):
+        self.sources.append(source)
+        return SimpleNamespace(session_id=self.session_id, session_key=self.session_key)
+
+    def append_to_transcript(self, session_id: str, message: dict, skip_db: bool = False):
+        self.appended.append(
+            {
+                "session_id": session_id,
+                "message": message,
+                "skip_db": skip_db,
+            }
+        )
 
 
 class TestGrixConfig:
@@ -569,6 +592,135 @@ class TestGrixAdapter:
         assert seen_events[0].text == "hello from card"
         assert seen_events[0].raw_message["_grix_kind"] == "message"
         assert fake_client.completed_events[0]["status"] == STATUS_RESPONDED
+
+    @pytest.mark.asyncio
+    async def test_record_only_event_msg_is_persisted_without_processing(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        session_store = FakeSessionStore()
+        adapter._client = fake_client
+        adapter.set_session_store(session_store)
+
+        seen_events = []
+
+        async def handler(event):
+            seen_events.append(event)
+            return "should not run"
+
+        adapter.set_message_handler(handler)
+        await adapter._handle_protocol_packet(
+            {
+                "cmd": "event_msg",
+                "seq": 0,
+                "payload": {
+                    "event_id": "evt-record-only-1",
+                    "event_type": "group_message",
+                    "mirror_mode": "record_only",
+                    "session_type": 2,
+                    "session_id": "g_1001",
+                    "thread_id": "topic-a",
+                    "msg_id": "61",
+                    "sender_id": "u_8",
+                    "sender_name": "alice",
+                    "content": "/stop",
+                },
+            }
+        )
+
+        await _wait_for(lambda: len(fake_client.acknowledged_events) == 1)
+
+        assert seen_events == []
+        assert fake_client.completed_events == []
+        assert fake_client.sent == []
+        assert session_store.appended[0]["session_id"] == "sess-1"
+        assert session_store.appended[0]["message"]["role"] == "user"
+        assert session_store.appended[0]["message"]["content"] == "[alice] /stop"
+        assert session_store.appended[0]["message"]["mirror_mode"] == "record_only"
+
+    @pytest.mark.asyncio
+    async def test_record_only_event_msg_does_not_interrupt_active_session(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        source = adapter.build_source(
+            chat_id="g_1001",
+            chat_type="group",
+            user_id="u_8",
+            user_name="alice",
+            thread_id="topic-a",
+        )
+        session_key = build_session_key(source)
+        session_store = FakeSessionStore(session_key=session_key)
+        adapter._client = fake_client
+        adapter.set_session_store(session_store)
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        async def handler(event):
+            raise AssertionError("record_only events must not reach the message handler")
+
+        adapter.set_message_handler(handler)
+        await adapter._handle_protocol_packet(
+            {
+                "cmd": "event_msg",
+                "seq": 0,
+                "payload": {
+                    "event_id": "evt-record-only-2",
+                    "event_type": "group_message",
+                    "mirror_mode": "record_only",
+                    "session_type": 2,
+                    "session_id": "g_1001",
+                    "thread_id": "topic-a",
+                    "msg_id": "62",
+                    "sender_id": "u_8",
+                    "sender_name": "alice",
+                    "content": "just mirror this",
+                },
+            }
+        )
+
+        assert session_key not in adapter._pending_messages
+        assert adapter._active_sessions[session_key].is_set() is False
+        assert fake_client.completed_events == []
+        assert len(session_store.appended) == 1
+
+    @pytest.mark.asyncio
+    async def test_on_processing_complete_reports_failure_status(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        event = MessageEvent(
+            text="hello",
+            source=adapter.build_source(chat_id="g_1001", chat_type="group"),
+            raw_message={"_grix_kind": "message", "event_id": "evt-processing-failure-1"},
+        )
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        assert fake_client.completed_events == [
+            {
+                "event_id": "evt-processing-failure-1",
+                "status": STATUS_FAILED,
+                "message": "message processing failed",
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_event_msg_acknowledges_before_route_bind_completes(self):

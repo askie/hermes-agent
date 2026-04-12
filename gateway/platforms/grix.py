@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from gateway.config import Platform, PlatformConfig
@@ -32,8 +33,12 @@ from gateway.platforms.aibot_contract import (
     STATUS_STOPPED,
     STATUS_UNSUPPORTED,
 )
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.platforms.card_actions import attach_card_action_metadata, build_card_action_command
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
+from gateway.platforms.card_actions import (
+    attach_card_action_metadata,
+    build_card_action_command,
+    build_card_action_user_text,
+)
 from gateway.platforms.grix_protocol import (
     GrixConnectionConfig,
     GrixEditEvent,
@@ -186,6 +191,10 @@ def _resolve_message_type(message: GrixInboundMessage) -> MessageType:
     if kind == "audio" or mime_type.startswith("audio/"):
         return MessageType.AUDIO
     return MessageType.DOCUMENT
+
+
+def _is_record_only_message(message: GrixInboundMessage) -> bool:
+    return str(getattr(message, "mirror_mode", "") or "").strip().lower() == "record_only"
 
 
 def _source_field(source: Any, field: str) -> Optional[str]:
@@ -605,7 +614,7 @@ class GrixAdapter(BasePlatformAdapter):
 
         return {"id": str(chat_id), "name": str(chat_id), "type": "dm"}
 
-    async def on_processing_complete(self, event: MessageEvent, success: bool) -> None:
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
         if raw_message.get("_grix_kind") != "message":
             return
@@ -613,9 +622,107 @@ class GrixAdapter(BasePlatformAdapter):
         if not isinstance(event_id, str) or not event_id.strip():
             return
 
-        status = STATUS_RESPONDED if success else STATUS_FAILED
-        message = None if success else "message processing failed"
+        is_success = outcome == ProcessingOutcome.SUCCESS or outcome is True
+        status = STATUS_RESPONDED if is_success else STATUS_FAILED
+        message = None if is_success else "message processing failed"
         await self._complete_event_if_needed(event_id.strip(), status=status, message=message)
+
+    def _build_record_only_attachment_summary(self, message: GrixInboundMessage) -> str:
+        attachments = list(message.attachments or [])
+        if not attachments:
+            return ""
+
+        labels = []
+        for attachment in attachments[:3]:
+            label = (
+                str(attachment.file_name or "").strip()
+                or str(attachment.kind or "").strip()
+                or str(attachment.mime_type or "").strip()
+                or "attachment"
+            )
+            labels.append(label)
+
+        summary = ", ".join(labels)
+        remaining = len(attachments) - len(labels)
+        if remaining > 0:
+            summary += f" (+{remaining} more)"
+        return summary
+
+    def _build_record_only_transcript_content(
+        self,
+        message: GrixInboundMessage,
+        source: Any,
+    ) -> str:
+        if message.content_type == "card_action":
+            content = build_card_action_user_text(
+                message.card_action_tag or "button",
+                message.card_action_value,
+            )
+        else:
+            content = str(message.text or "").strip()
+
+        attachment_summary = self._build_record_only_attachment_summary(message)
+        if attachment_summary:
+            suffix = f"[Attachments: {attachment_summary}]"
+            content = f"{content}\n\n{suffix}" if content else suffix
+
+        if not content:
+            if message.content_type == "interactive_invalid":
+                content = "[Recorded without processing: invalid interactive payload]"
+            else:
+                content = "[Recorded without processing: empty message]"
+
+        thread_is_shared = (
+            getattr(source, "chat_type", "") != "dm"
+            and bool(getattr(source, "thread_id", None))
+            and not self.config.extra.get("thread_sessions_per_user", False)
+        )
+        sender_name = str(getattr(source, "user_name", "") or "").strip()
+        if thread_is_shared and sender_name:
+            content = f"[{sender_name}] {content}"
+        return content
+
+    async def _record_message_without_processing(
+        self,
+        *,
+        message: GrixInboundMessage,
+        source: Any,
+    ) -> None:
+        session_store = getattr(self, "_session_store", None)
+        if session_store is None:
+            logger.warning(
+                "[%s] Dropping record_only GRIX event %s: session store unavailable",
+                self.name,
+                message.event_id,
+            )
+            return
+
+        session_entry = session_store.get_or_create_session(source)
+        transcript_entry: Dict[str, Any] = {
+            "role": "user",
+            "content": self._build_record_only_transcript_content(message, source),
+            "timestamp": datetime.now().isoformat(),
+            "event_id": message.event_id,
+            "message_id": message.message_id,
+            "mirror_mode": message.mirror_mode,
+            "_grix_kind": "message",
+        }
+        if message.reply_to_message_id:
+            transcript_entry["reply_to_message_id"] = message.reply_to_message_id
+        if message.thread_id:
+            transcript_entry["thread_id"] = message.thread_id
+        if message.attachments:
+            transcript_entry["attachments"] = [
+                {
+                    "url": attachment.url,
+                    "mime_type": attachment.mime_type,
+                    "kind": attachment.kind,
+                    "file_name": attachment.file_name,
+                }
+                for attachment in message.attachments
+            ]
+
+        session_store.append_to_transcript(session_entry.session_id, transcript_entry)
 
     async def _handle_transport_status(self, status: Dict[str, Any]) -> None:
         if self._disconnect_requested:
@@ -761,6 +868,13 @@ class GrixAdapter(BasePlatformAdapter):
                 session_key=session_key,
                 session_id=message.session_id,
             )
+
+        if _is_record_only_message(message):
+            await self._record_message_without_processing(
+                message=message,
+                source=source,
+            )
+            return
 
         if message.content_type == "interactive_invalid":
             logger.warning(
