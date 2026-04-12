@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.card_actions import (
+    attach_card_action_metadata,
+    build_card_action_command,
+    build_card_action_user_text,
+)
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -59,6 +64,7 @@ def _make_runner():
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner._running_agents = {}
+    runner._running_agents_ts = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = None
@@ -66,6 +72,7 @@ def _make_runner():
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._show_reasoning = False
+    runner._draining = False
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
@@ -164,3 +171,43 @@ async def test_underscored_alias_for_hyphenated_builtin_not_flagged(monkeypatch)
     # Whatever /reload_mcp returns, it must not be the unknown-command guard.
     if result is not None:
         assert "Unknown command" not in result
+
+
+@pytest.mark.asyncio
+async def test_manual_card_command_still_reported_unknown():
+    """Users typing /card manually must still hit the unknown-command guard."""
+    runner = _make_runner()
+
+    result = await runner._handle_message(_make_event("/card button"))
+
+    assert result is not None
+    assert "Unknown command" in result
+    assert "/card" in result
+
+
+@pytest.mark.asyncio
+async def test_trusted_synthetic_card_action_bypasses_unknown_guard():
+    """Trusted platform card callbacks should reach the agent as normalized text."""
+    runner = _make_runner()
+    seen = {}
+
+    async def _capture(event, source, quick_key):
+        seen["event"] = event
+        seen["source"] = source
+        seen["quick_key"] = quick_key
+        return "accepted"
+
+    runner._handle_message_with_agent = AsyncMock(side_effect=_capture)
+    event = _make_event(build_card_action_command("confirm", {"choice": "yes"}))
+    event.raw_message = attach_card_action_metadata(
+        {},
+        action_tag="confirm",
+        action_value={"choice": "yes"},
+        platform=Platform.GRIX.value,
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "accepted"
+    assert seen["event"].text == build_card_action_user_text("confirm", {"choice": "yes"})
+    assert seen["event"].message_type == MessageType.TEXT

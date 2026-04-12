@@ -258,6 +258,10 @@ from gateway.platforms.base import (
     MessageType,
     merge_pending_message_event,
 )
+from gateway.platforms.card_actions import (
+    build_card_action_user_text,
+    extract_card_action_metadata,
+)
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -2710,13 +2714,21 @@ class GatewayRunner:
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        _quick_key = self._session_key_for_source(source)
+        card_action = extract_card_action_metadata(event.raw_message)
+        if card_action is not None:
+            event.text = build_card_action_user_text(
+                card_action.get("tag"),
+                card_action.get("value"),
+            )
+            event.message_type = MessageType.TEXT
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
         # .update_response so the update process can continue.
-        _quick_key = self._session_key_for_source(source)
         _update_prompts = getattr(self, "_update_prompt_pending", {})
-        if _update_prompts.get(_quick_key):
+        if _update_prompts.get(_quick_key) and card_action is None:
             raw = (event.text or "").strip()
             # Accept /approve and /deny as shorthand for yes/no
             cmd = event.get_command()

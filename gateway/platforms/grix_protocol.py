@@ -50,6 +50,12 @@ _CARD_ACTION_VALUE_KEYS = (
     "state",
     "form_data",
 )
+_CARD_ACTION_EVENT_TYPE_TOKENS = (
+    "card_action",
+    "card.action",
+    "interactive_card_action",
+    "interactive.action",
+)
 
 
 def clamp_int(value: Any, fallback: int, minimum: int, maximum: int) -> int:
@@ -441,6 +447,21 @@ def _dict_has_card_hint(value: Optional[Dict[str, Any]]) -> bool:
     return False
 
 
+def _has_explicit_card_action_key(value: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(key in value for key in _CARD_ACTION_KEYS)
+
+
+def _is_card_action_event_type(value: Any) -> bool:
+    lowered = normalize_text(value).lower()
+    if not lowered:
+        return False
+    if any(token in lowered for token in _CARD_ACTION_EVENT_TYPE_TOKENS):
+        return True
+    return "action" in lowered and ("card" in lowered or "interactive" in lowered)
+
+
 def _extract_action_tag(value: Dict[str, Any]) -> str:
     for key in _CARD_ACTION_TAG_KEYS:
         tag = normalize_text(value.get(key))
@@ -486,6 +507,8 @@ def _iter_card_action_candidates(
     channel_data: Optional[Dict[str, Any]],
     structured_content: Any,
 ):
+    event_type_is_card_action = _is_card_action_event_type(payload.get("event_type"))
+
     for container in (payload, channel_data or {}, biz_card or {}):
         if not isinstance(container, dict):
             continue
@@ -493,7 +516,7 @@ def _iter_card_action_candidates(
             if key in container:
                 yield container.get(key)
 
-    if isinstance(structured_content, dict):
+    if isinstance(structured_content, dict) and event_type_is_card_action:
         if any(key in structured_content for key in _CARD_ACTION_VALUE_KEYS):
             yield structured_content
         elif any(normalize_text(structured_content.get(key)) for key in _CARD_ACTION_TAG_KEYS):
@@ -508,6 +531,13 @@ def resolve_card_action(
     content_value: Any,
 ) -> tuple[Optional[str], Any, bool]:
     structured_content = _load_structured_content(content_value)
+    event_type_is_card_action = _is_card_action_event_type(payload.get("event_type"))
+    explicit_action_signal = (
+        event_type_is_card_action
+        or _has_explicit_card_action_key(payload)
+        or _has_explicit_card_action_key(channel_data)
+        or _has_explicit_card_action_key(biz_card)
+    )
 
     for candidate in _iter_card_action_candidates(
         payload,
@@ -519,24 +549,10 @@ def resolve_card_action(
         if resolved is not None:
             return resolved[0], resolved[1], True
 
-    event_type = normalize_text(payload.get("event_type")).lower()
-    has_card_signal = (
-        "card" in event_type
-        or "interactive" in event_type
-        or bool(biz_card)
-        or _dict_has_card_hint(channel_data)
-    )
-    if not has_card_signal:
+    if not explicit_action_signal:
         return None, None, False
 
-    fallback_value = structured_content
-    if fallback_value is None:
-        fallback_text = normalize_message_text(content_value)
-        if fallback_text:
-            fallback_value = fallback_text
-    if fallback_value is None:
-        return None, None, True
-    return "button", fallback_value, True
+    return None, None, True
 
 
 def normalize_mentions(value: Any) -> List[str]:

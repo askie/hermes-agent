@@ -526,6 +526,51 @@ class TestGrixAdapter:
         assert fake_client.completed_events[0]["message"] == "invalid interactive card payload"
 
     @pytest.mark.asyncio
+    async def test_event_msg_with_card_display_metadata_stays_text(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        seen_events = []
+
+        async def handler(event):
+            seen_events.append(event)
+            return "display received"
+
+        adapter.set_message_handler(handler)
+        await adapter._handle_protocol_packet(
+            {
+                "cmd": "event_msg",
+                "seq": 0,
+                "payload": {
+                    "event_id": "evt-card-display-1",
+                    "event_type": "group_message",
+                    "session_type": 2,
+                    "session_id": "g_1001",
+                    "msg_id": "card-57",
+                    "sender_id": "u_8",
+                    "sender_name": "alice",
+                    "content": "hello from card",
+                    "biz_card": {"kind": "interactive", "title": "Card Title"},
+                },
+            }
+        )
+
+        await _wait_for(lambda: len(seen_events) == 1)
+        await _wait_for(lambda: len(fake_client.completed_events) == 1)
+
+        assert seen_events[0].message_type == MessageType.TEXT
+        assert seen_events[0].text == "hello from card"
+        assert seen_events[0].raw_message["_grix_kind"] == "message"
+        assert fake_client.completed_events[0]["status"] == STATUS_RESPONDED
+
+    @pytest.mark.asyncio
     async def test_event_msg_acknowledges_before_route_bind_completes(self):
         adapter = GrixAdapter(
             PlatformConfig(

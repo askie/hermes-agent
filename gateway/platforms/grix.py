@@ -33,7 +33,7 @@ from gateway.platforms.aibot_contract import (
     STATUS_UNSUPPORTED,
 )
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.platforms.card_actions import build_card_action_command
+from gateway.platforms.card_actions import attach_card_action_metadata, build_card_action_command
 from gateway.platforms.grix_protocol import (
     GrixConnectionConfig,
     GrixEditEvent,
@@ -787,6 +787,12 @@ class GrixAdapter(BasePlatformAdapter):
             )
             event_message_type = MessageType.COMMAND
             raw_kind = "card_action"
+            raw_message = attach_card_action_metadata(
+                raw_message,
+                action_tag=message.card_action_tag or "button",
+                action_value=message.card_action_value,
+                platform=self.platform.value,
+            )
             raw_message["card_action"] = {
                 "tag": message.card_action_tag or "button",
                 "value": message.card_action_value,

@@ -105,7 +105,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_image_from_bytes,
 )
-from gateway.platforms.card_actions import build_card_action_command
+from gateway.platforms.card_actions import attach_card_action_metadata, build_card_action_command
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
 
@@ -2085,7 +2085,12 @@ class FeishuAdapter(BasePlatformAdapter):
             text=synthetic_text,
             message_type=MessageType.COMMAND,
             source=source,
-            raw_message=data,
+            raw_message=attach_card_action_metadata(
+                data,
+                action_tag=action_tag,
+                action_value=action_value,
+                platform=self.platform.value,
+            ),
             message_id=token or str(uuid.uuid4()),
             timestamp=datetime.now(),
         )
