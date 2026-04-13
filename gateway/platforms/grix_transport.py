@@ -354,6 +354,8 @@ class GrixTransportClient:
         reply_to_message_id: Optional[str] = None,
         thread_id: Optional[str] = None,
         event_id: Optional[str] = None,
+        biz_card: Optional[Dict[str, Any]] = None,
+        channel_data: Optional[Dict[str, Any]] = None,
         timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -367,6 +369,10 @@ class GrixTransportClient:
             payload["thread_id"] = thread_id.strip()
         if event_id:
             payload["event_id"] = event_id.strip()
+        if isinstance(biz_card, dict) and biz_card:
+            payload["biz_card"] = biz_card
+        if isinstance(channel_data, dict) and channel_data:
+            payload["channel_data"] = channel_data
 
         packet = await self.request(
             CMD_SEND_MSG,

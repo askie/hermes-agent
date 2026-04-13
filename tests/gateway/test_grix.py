@@ -295,6 +295,51 @@ class TestGrixTransport:
         await client.disconnect()
 
     @pytest.mark.asyncio
+    async def test_send_text_forwards_top_level_structured_fields(self):
+        socket = FakeSocket()
+        client = GrixTransportClient(
+            _transport_config(),
+            connector=lambda _config: asyncio.sleep(0, result=socket),
+        )
+
+        await _connect_client(client, socket)
+
+        send_task = asyncio.create_task(
+            client.send_text(
+                "g_1001",
+                "approval pending",
+                biz_card={
+                    "version": 1,
+                    "type": "exec_approval",
+                    "payload": {"approval_id": "req_123"},
+                },
+                channel_data={
+                    "hermes": {
+                        "execApprovalPending": {"approval_id": "req_123"}
+                    }
+                },
+            )
+        )
+        await _wait_for(lambda: len(socket.sent_text) >= 2)
+        send_packet = decode_packet(socket.sent_text[-1])
+        assert send_packet["payload"]["biz_card"] == {
+            "version": 1,
+            "type": "exec_approval",
+            "payload": {"approval_id": "req_123"},
+        }
+        assert send_packet["payload"]["channel_data"] == {
+            "hermes": {
+                "execApprovalPending": {"approval_id": "req_123"}
+            }
+        }
+
+        await socket.push_packet(build_packet(CMD_SEND_ACK, {"msg_id": "66"}, send_packet["seq"]))
+        receipt = await send_task
+        assert receipt["message_id"] == "66"
+
+        await client.disconnect()
+
+    @pytest.mark.asyncio
     async def test_auth_rejected(self):
         socket = FakeSocket()
         client = GrixTransportClient(
@@ -945,7 +990,49 @@ class TestGrixAdapter:
         assert fake_client.sent[0]["thread_id"] == "topic-a"
 
     @pytest.mark.asyncio
-    async def test_send_exec_approval_emits_backend_compatible_prompt(self):
+    async def test_send_forwards_structured_metadata_without_rewriting(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        result = await adapter.send(
+            chat_id="g_1001",
+            content="structured fallback",
+            metadata={
+                "biz_card": {
+                    "version": 1,
+                    "type": "exec_status",
+                    "payload": {"status": "running", "summary": "Working"},
+                },
+                "channel_data": {
+                    "hermes": {
+                        "trace_id": "trace-1",
+                    }
+                },
+            },
+        )
+
+        assert result.success is True
+        assert fake_client.sent[0]["text"] == "structured fallback"
+        assert fake_client.sent[0]["biz_card"] == {
+            "version": 1,
+            "type": "exec_status",
+            "payload": {"status": "running", "summary": "Working"},
+        }
+        assert fake_client.sent[0]["channel_data"] == {
+            "hermes": {
+                "trace_id": "trace-1",
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_emits_structured_card_payload(self):
         adapter = GrixAdapter(
             PlatformConfig(
                 enabled=True,
@@ -961,17 +1048,58 @@ class TestGrixAdapter:
             command="rm -rf /tmp/demo",
             session_key="agent:main:grix:group:g_1001:topic-a",
             description="dangerous deletion",
+            metadata={
+                "approval_data": {
+                    "approval_id": "req_123",
+                    "pattern_key": "dangerous deletion",
+                    "pattern_keys": ["dangerous deletion", "filesystem mutation"],
+                }
+            },
             approval_id="req_123",
         )
 
         assert result.success is True
         assert "req_123" in adapter._approval_state
-        sent_text = fake_client.sent[0]["text"]
-        assert sent_text.startswith("🔒 Exec approval required")
-        assert "ID: req_123" in sent_text
-        assert "Command: rm -rf /tmp/demo" in sent_text
-        assert "Host: Hermes Grix" in sent_text
-        assert "Expires in: 300s" in sent_text
+        sent = fake_client.sent[0]
+        assert sent["text"].startswith("[Exec Approval] rm -rf /tmp/demo")
+        assert sent["biz_card"] == {
+            "version": 1,
+            "type": "exec_approval",
+            "payload": {
+                "approval_id": "req_123",
+                "approval_slug": "req_123",
+                "approval_command_id": "req_123",
+                "command": "rm -rf /tmp/demo",
+                "host": "hermes",
+                "allowed_decisions": ["allow-once", "allow-always", "deny"],
+                "decision_commands": {
+                    "allow-once": "/approve req_123 allow-once",
+                    "allow-always": "/approve req_123 allow-always",
+                    "deny": "/approve req_123 deny",
+                },
+                "expires_in_seconds": 300,
+                "warning_text": "dangerous deletion",
+            },
+        }
+        assert sent["channel_data"] == {
+            "hermes": {
+                "execApprovalPending": {
+                    "approval_id": "req_123",
+                    "pattern_key": "dangerous deletion",
+                    "pattern_keys": ["dangerous deletion", "filesystem mutation"],
+                    "command": "rm -rf /tmp/demo",
+                    "description": "dangerous deletion",
+                    "host": "hermes",
+                    "expires_in_seconds": 300,
+                    "allowed_decisions": ["allow-once", "allow-always", "deny"],
+                    "decision_commands": {
+                        "allow-once": "/approve req_123 allow-once",
+                        "allow-always": "/approve req_123 allow-always",
+                        "deny": "/approve req_123 deny",
+                    },
+                }
+            }
+        }
 
     @pytest.mark.asyncio
     async def test_local_action_approve_resolves_specific_approval(self):

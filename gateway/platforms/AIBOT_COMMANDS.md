@@ -352,7 +352,20 @@
     "content": "hello",
     "quoted_message_id": "54",
     "thread_id": "topic-a",
-    "event_id": "evt-1"
+    "event_id": "evt-1",
+    "biz_card": {
+      "version": 1,
+      "type": "exec_status",
+      "payload": {
+        "status": "running",
+        "summary": "Command is running"
+      }
+    },
+    "channel_data": {
+      "hermes": {
+        "trace_id": "trace-1"
+      }
+    }
   }
 }
 ```
@@ -365,6 +378,8 @@
 - `quoted_message_id` 可选
 - `thread_id` 可选
 - `event_id` 可选
+- `biz_card` 可选，用于原样透传结构化业务卡片
+- `channel_data` 可选，用于原样透传结构化附加数据
 
 ### 7.2 `send_ack`
 

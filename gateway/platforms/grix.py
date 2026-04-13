@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ from gateway.platforms.card_actions import (
     build_card_action_command,
     build_card_action_user_text,
 )
+from gateway.platforms.hermes_exec_approval import build_exec_approval_message
 from gateway.platforms.grix_protocol import (
     GrixConnectionConfig,
     GrixEditEvent,
@@ -68,8 +70,6 @@ logger = logging.getLogger(__name__)
 
 MAX_TEXT_LENGTH = 4000
 _INVALID_INTERACTIVE_CARD_MESSAGE = "invalid interactive card payload"
-_EXEC_APPROVAL_HOST = "Hermes Grix"
-_EXEC_APPROVAL_TIMEOUT_SEC = 300
 _ROUTE_SESSION_KEY_PREFIX = "agent:main:grix:"
 _EVENT_DEDUP_WINDOW_SECONDS = 300
 _EVENT_DEDUP_MAX_SIZE = 1000
@@ -116,38 +116,6 @@ def _approval_choice_from_action(action_type: str, params: Dict[str, Any]) -> tu
     if decision == "deny":
         return "deny", decision
     return None, decision or None
-
-
-def _build_exec_approval_lines(command: str) -> list[str]:
-    normalized = str(command or "").replace("\r\n", "\n").strip()
-    if "\n" not in normalized:
-        return [f"Command: {normalized}"]
-
-    return [
-        "Command:",
-        "```",
-        *normalized.split("\n"),
-        "```",
-    ]
-
-
-def _build_exec_approval_text(
-    approval_id: str,
-    command: str,
-    description: str,
-    timeout_sec: int,
-) -> str:
-    lines = [
-        "🔒 Exec approval required",
-        f"ID: {approval_id}",
-        *_build_exec_approval_lines(command),
-        f"Host: {_EXEC_APPROVAL_HOST}",
-        f"Expires in: {max(timeout_sec, 1)}s",
-    ]
-    normalized_description = str(description or "").strip()
-    if normalized_description:
-        lines.append(f"Reason: {normalized_description}")
-    return "\n".join(lines)
 
 
 def build_grix_connection_config(config: PlatformConfig) -> GrixConnectionConfig:
@@ -205,6 +173,15 @@ def _source_field(source: Any, field: str) -> Optional[str]:
     else:
         value = getattr(source, field, None)
     return str(value).strip() if value else None
+
+
+def _clone_metadata_object(metadata: Optional[Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(key)
+    if not isinstance(value, dict) or not value:
+        return None
+    return copy.deepcopy(value)
 
 
 def _lookup_grix_session_origin(session_key: str) -> Optional[Dict[str, Optional[str]]]:
@@ -456,6 +433,8 @@ class GrixAdapter(BasePlatformAdapter):
             raw_event_id = metadata.get("event_id")
             if isinstance(raw_event_id, str) and raw_event_id.strip():
                 event_id = raw_event_id.strip()
+        biz_card = _clone_metadata_object(metadata, "biz_card")
+        channel_data = _clone_metadata_object(metadata, "channel_data")
 
         try:
             receipt = await self._client.send_text(
@@ -464,6 +443,8 @@ class GrixAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to,
                 thread_id=thread_id,
                 event_id=event_id,
+                biz_card=biz_card,
+                channel_data=channel_data,
             )
             if event_id:
                 await self._complete_event_if_needed(event_id, status=STATUS_RESPONDED)
@@ -511,18 +492,26 @@ class GrixAdapter(BasePlatformAdapter):
             thread_id=self._metadata_thread_id(metadata),
             source_hint=source_hint,
         )
-        text = _build_exec_approval_text(
+        raw_approval_data = None
+        if isinstance(metadata, dict):
+            candidate = metadata.get("approval_data")
+            if isinstance(candidate, dict):
+                raw_approval_data = candidate
+
+        message = build_exec_approval_message(
             approval_id=resolved_approval_id,
-            command=command[:3000] + "..." if len(command) > 3000 else command,
+            command=command,
             description=description,
-            timeout_sec=_EXEC_APPROVAL_TIMEOUT_SEC,
+            raw_approval_data=raw_approval_data,
         )
 
         try:
             receipt = await self._client.send_text(
                 str(session_id),
-                text,
+                message.content,
                 thread_id=thread_id,
+                biz_card=message.biz_card,
+                channel_data=message.channel_data,
             )
             self._approval_state[resolved_approval_id] = {
                 "session_key": str(session_key).strip(),

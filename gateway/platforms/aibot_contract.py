@@ -161,6 +161,8 @@ RECOMMENDED_PUBLIC_FIELDS = (
     "quoted_message_id",
     "attachments",
     "mention_user_ids",
+    "biz_card",
+    "channel_data",
     "status",
     "code",
     "msg",
