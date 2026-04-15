@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -358,11 +359,20 @@ class GrixTransportClient:
         channel_data: Optional[Dict[str, Any]] = None,
         timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
+        stripped_session = session_id.strip()
         payload: Dict[str, Any] = {
-            "session_id": session_id.strip(),
+            "session_id": stripped_session,
             "msg_type": 1,
             "content": text,
         }
+        if event_id:
+            client_msg_id = f"hermes_{event_id.strip()}"
+        else:
+            digest = hashlib.sha256(
+                f"{stripped_session}:{time.monotonic_ns()}".encode()
+            ).hexdigest()[:16]
+            client_msg_id = f"hermes_{digest}"
+        payload["client_msg_id"] = client_msg_id
         if reply_to_message_id:
             payload["quoted_message_id"] = reply_to_message_id.strip()
         if thread_id:

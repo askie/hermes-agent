@@ -128,6 +128,7 @@ class TestAibotV1Baseline:
             "session_id": "g_1001",
             "msg_type": 1,
             "content": "hello",
+            "client_msg_id": "hermes_evt-1",
             "quoted_message_id": "54",
             "thread_id": "topic-a",
             "event_id": "evt-1",

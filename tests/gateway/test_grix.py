@@ -340,6 +340,96 @@ class TestGrixTransport:
         await client.disconnect()
 
     @pytest.mark.asyncio
+    async def test_send_text_client_msg_id_from_event_id(self):
+        socket = FakeSocket()
+        client = GrixTransportClient(
+            _transport_config(),
+            connector=lambda _config: asyncio.sleep(0, result=socket),
+        )
+
+        await _connect_client(client, socket)
+
+        send_task = asyncio.create_task(
+            client.send_text("g_1001", "hello", event_id="evt-42")
+        )
+        await _wait_for(lambda: len(socket.sent_text) >= 2)
+        send_packet = decode_packet(socket.sent_text[-1])
+        assert send_packet["payload"]["client_msg_id"] == "hermes_evt-42"
+
+        await socket.push_packet(build_packet(CMD_SEND_ACK, {"msg_id": "1"}, send_packet["seq"]))
+        await send_task
+        await client.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_send_text_client_msg_id_stable_for_same_event(self):
+        socket = FakeSocket()
+        client = GrixTransportClient(
+            _transport_config(),
+            connector=lambda _config: asyncio.sleep(0, result=socket),
+        )
+
+        await _connect_client(client, socket)
+
+        first = asyncio.create_task(
+            client.send_text("g_1001", "hello", event_id="evt-repeat")
+        )
+        await _wait_for(lambda: len(socket.sent_text) >= 2)
+        send_packet_1 = decode_packet(socket.sent_text[-1])
+        await socket.push_packet(
+            build_packet(CMD_SEND_ACK, {"msg_id": "1"}, send_packet_1["seq"])
+        )
+        await first
+
+        second = asyncio.create_task(
+            client.send_text("g_1001", "hello again", event_id="evt-repeat")
+        )
+        await _wait_for(lambda: len(socket.sent_text) >= 3)
+        send_packet_2 = decode_packet(socket.sent_text[-1])
+        await socket.push_packet(
+            build_packet(CMD_SEND_ACK, {"msg_id": "2"}, send_packet_2["seq"])
+        )
+        await second
+
+        assert send_packet_1["payload"]["client_msg_id"] == "hermes_evt-repeat"
+        assert send_packet_2["payload"]["client_msg_id"] == "hermes_evt-repeat"
+
+        await client.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_send_text_client_msg_id_unique_without_event_id(self):
+        socket = FakeSocket()
+        client = GrixTransportClient(
+            _transport_config(),
+            connector=lambda _config: asyncio.sleep(0, result=socket),
+        )
+
+        await _connect_client(client, socket)
+
+        first = asyncio.create_task(client.send_text("g_1001", "msg a"))
+        await _wait_for(lambda: len(socket.sent_text) >= 2)
+        send_packet_1 = decode_packet(socket.sent_text[-1])
+        await socket.push_packet(
+            build_packet(CMD_SEND_ACK, {"msg_id": "1"}, send_packet_1["seq"])
+        )
+        await first
+
+        second = asyncio.create_task(client.send_text("g_1001", "msg b"))
+        await _wait_for(lambda: len(socket.sent_text) >= 3)
+        send_packet_2 = decode_packet(socket.sent_text[-1])
+        await socket.push_packet(
+            build_packet(CMD_SEND_ACK, {"msg_id": "2"}, send_packet_2["seq"])
+        )
+        await second
+
+        cid_1 = send_packet_1["payload"]["client_msg_id"]
+        cid_2 = send_packet_2["payload"]["client_msg_id"]
+        assert cid_1 != cid_2
+        assert cid_1.startswith("hermes_")
+        assert cid_2.startswith("hermes_")
+
+        await client.disconnect()
+
+    @pytest.mark.asyncio
     async def test_auth_rejected(self):
         socket = FakeSocket()
         client = GrixTransportClient(
