@@ -7,7 +7,6 @@ import copy
 import json
 import logging
 import os
-import re
 import time
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -36,8 +35,6 @@ from gateway.platforms.aibot_contract import (
 )
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.platforms.card_actions import (
-    attach_card_action_metadata,
-    build_card_action_command,
     build_card_action_user_text,
 )
 from gateway.platforms.hermes_exec_approval import build_exec_approval_message
@@ -68,33 +65,13 @@ from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
-MAX_TEXT_LENGTH = 4000
-_INVALID_INTERACTIVE_CARD_MESSAGE = "invalid interactive card payload"
 _ROUTE_SESSION_KEY_PREFIX = "agent:main:grix:"
 _EVENT_DEDUP_WINDOW_SECONDS = 300
 _EVENT_DEDUP_MAX_SIZE = 1000
-_STRIP_MARKDOWN_REPLACEMENTS = (
-    (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),
-    (re.compile(r"\*(.+?)\*", re.DOTALL), r"\1"),
-    (re.compile(r"__(.+?)__", re.DOTALL), r"\1"),
-    (re.compile(r"_(.+?)_", re.DOTALL), r"\1"),
-    (re.compile(r"```[a-zA-Z0-9_+-]*\n?"), ""),
-    (re.compile(r"`(.+?)`", re.DOTALL), r"\1"),
-    (re.compile(r"^#{1,6}\s+", re.MULTILINE), ""),
-    (re.compile(r"\[([^\]]+)\]\(([^\)]+)\)"), r"\1"),
-)
 
 
 def check_grix_requirements() -> bool:
     return AIOHTTP_AVAILABLE
-
-
-def _strip_markdown(text: str) -> str:
-    cleaned = text
-    for pattern, replacement in _STRIP_MARKDOWN_REPLACEMENTS:
-        cleaned = pattern.sub(replacement, cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
 
 
 def _approval_lookup_id(params: Dict[str, Any]) -> str:
@@ -291,7 +268,7 @@ async def resolve_grix_target(
 
 class GrixAdapter(BasePlatformAdapter):
     platform = Platform.GRIX
-    MAX_MESSAGE_LENGTH = MAX_TEXT_LENGTH
+    MAX_MESSAGE_LENGTH = 4000
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.GRIX)
@@ -311,7 +288,7 @@ class GrixAdapter(BasePlatformAdapter):
         self._approval_state: Dict[str, Dict[str, Optional[str]]] = {}
 
     def format_message(self, content: str) -> str:
-        return _strip_markdown(content)
+        return content
 
     def _schedule_session_route_bind(self, *, session_key: str, session_id: str) -> None:
         client = self._client
@@ -867,35 +844,17 @@ class GrixAdapter(BasePlatformAdapter):
 
         if message.content_type == "interactive_invalid":
             logger.warning(
-                "[%s] Rejecting malformed GRIX interactive payload for event %s",
+                "[%s] Malformed GRIX interactive payload for event %s, falling back to text",
                 self.name,
                 message.event_id,
             )
-            if self._client:
-                await self._complete_event_if_needed(
-                    message.event_id,
-                    status=STATUS_FAILED,
-                    message=_INVALID_INTERACTIVE_CARD_MESSAGE,
-                )
-            return
 
         event_text = message.text
         event_message_type = _resolve_message_type(message)
         raw_kind = "message"
         raw_message = {**message.raw}
         if message.content_type == "card_action":
-            event_text = build_card_action_command(
-                message.card_action_tag or "button",
-                message.card_action_value,
-            )
-            event_message_type = MessageType.COMMAND
             raw_kind = "card_action"
-            raw_message = attach_card_action_metadata(
-                raw_message,
-                action_tag=message.card_action_tag or "button",
-                action_value=message.card_action_value,
-                platform=self.platform.value,
-            )
             raw_message["card_action"] = {
                 "tag": message.card_action_tag or "button",
                 "value": message.card_action_value,

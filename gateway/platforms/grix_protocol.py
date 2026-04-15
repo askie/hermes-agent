@@ -606,7 +606,6 @@ def normalize_inbound_message(payload: Dict[str, Any]) -> GrixInboundMessage:
     text_content = normalize_message_text(content_value)
     if card_action_tag:
         content_type = "card_action"
-        text_content = ""
     elif has_card_signal and not text_content:
         content_type = "interactive_invalid"
 

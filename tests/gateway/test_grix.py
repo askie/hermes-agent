@@ -494,11 +494,11 @@ class TestGrixAdapter:
         assert fake_client.bound_routes[0]["route_session_key"].startswith("agent:main:grix:group:g_1001:topic-a")
         assert fake_client.sent[0]["event_id"] == "evt-1"
         assert fake_client.sent[0]["reply_to_message_id"] == "55"
-        assert fake_client.sent[0]["text"] == "hello back"
+        assert fake_client.sent[0]["text"] == "**hello back**"
         assert fake_client.completed_events[0]["status"] == STATUS_RESPONDED
 
     @pytest.mark.asyncio
-    async def test_event_msg_routes_interactive_card_as_synthetic_command(self):
+    async def test_event_msg_passes_through_card_action_content(self):
         adapter = GrixAdapter(
             PlatformConfig(
                 enabled=True,
@@ -541,8 +541,7 @@ class TestGrixAdapter:
         await _wait_for(lambda: len(seen_events) == 1)
         await _wait_for(lambda: len(fake_client.completed_events) == 1)
 
-        assert seen_events[0].message_type == MessageType.COMMAND
-        assert seen_events[0].text == '/card confirm {"choice": "confirm"}'
+        assert seen_events[0].text == '{"value":{"choice":"confirm"}}'
         assert seen_events[0].raw_message["_grix_kind"] == "card_action"
         assert seen_events[0].raw_message["card_action"] == {
             "tag": "confirm",
@@ -551,7 +550,7 @@ class TestGrixAdapter:
         assert fake_client.completed_events[0]["status"] == STATUS_RESPONDED
 
     @pytest.mark.asyncio
-    async def test_event_msg_rejects_malformed_interactive_card_payload(self):
+    async def test_event_msg_falls_back_malformed_interactive_card_to_text(self):
         adapter = GrixAdapter(
             PlatformConfig(
                 enabled=True,
@@ -586,12 +585,13 @@ class TestGrixAdapter:
             }
         )
 
+        await _wait_for(lambda: len(seen_events) == 1)
         await _wait_for(lambda: len(fake_client.completed_events) == 1)
 
-        assert seen_events == []
+        assert len(seen_events) == 1
+        assert seen_events[0].text == ""
         assert fake_client.acknowledged_events[0]["event_id"] == "evt-card-bad-1"
-        assert fake_client.completed_events[0]["status"] == "failed"
-        assert fake_client.completed_events[0]["message"] == "invalid interactive card payload"
+        assert fake_client.completed_events[0]["status"] == STATUS_RESPONDED
 
     @pytest.mark.asyncio
     async def test_event_msg_with_card_display_metadata_stays_text(self):
