@@ -52,6 +52,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
 # Platforms that support a configured cron/notification home target, mapped to
 # the environment variable used by gateway setup/runtime config.
 _HOME_TARGET_ENV_VARS = {
+    "grix": "GRIX_HOME_CHANNEL",
     "matrix": "MATRIX_HOME_ROOM",
     "telegram": "TELEGRAM_HOME_CHANNEL",
     "discord": "DISCORD_HOME_CHANNEL",

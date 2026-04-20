@@ -21,6 +21,7 @@ from gateway.platforms.aibot_contract import (
     CMD_SESSION_ROUTE_BIND,
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
+    LOCAL_ACTION_FILE_LIST,
     STATUS_FAILED,
     STATUS_RESPONDED,
     STATUS_STOPPED,
@@ -255,12 +256,12 @@ class TestGrixTooling:
         assert built.api_key == "secret"
         assert built.account_id == "main"
         assert CAP_LOCAL_ACTION_V1 in built.capabilities
-        assert built.local_actions == [LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT]
+        assert built.local_actions == [LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT, LOCAL_ACTION_FILE_LIST]
 
     def test_build_auth_payload_includes_local_actions(self):
         payload = build_auth_payload(_transport_config())
         assert CAP_LOCAL_ACTION_V1 in payload["capabilities"]
-        assert payload["local_actions"] == [LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT]
+        assert payload["local_actions"] == [LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT, LOCAL_ACTION_FILE_LIST]
 
 
 class TestGrixTransport:
