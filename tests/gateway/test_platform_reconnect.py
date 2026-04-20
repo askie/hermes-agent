@@ -373,12 +373,8 @@ class TestRuntimeDisconnectQueuing:
         assert Platform.TELEGRAM not in runner._failed_platforms
 
     @pytest.mark.asyncio
-    async def test_retryable_error_exits_for_service_restart_when_all_down(self):
-        """Gateway should exit with failure when all platforms fail with retryable errors.
-
-        This lets systemd Restart=on-failure restart the process, which is more
-        reliable than in-process background reconnection after exhausted retries.
-        """
+    async def test_retryable_error_stays_running_when_all_down(self):
+        """Gateway should stay alive and reconnect in the background when all platforms drop."""
         runner = _make_runner()
         runner.stop = AsyncMock()
 
@@ -388,9 +384,8 @@ class TestRuntimeDisconnectQueuing:
 
         await runner._handle_adapter_fatal_error(adapter)
 
-        # stop() SHOULD be called — gateway exits for systemd restart
-        runner.stop.assert_called_once()
-        assert runner._exit_with_failure is True
+        runner.stop.assert_not_called()
+        assert runner._exit_with_failure is False
         assert Platform.TELEGRAM in runner._failed_platforms
 
     @pytest.mark.asyncio

@@ -287,6 +287,10 @@ from gateway.platforms.base import (
     MessageType,
     merge_pending_message_event,
 )
+from gateway.platforms.card_actions import (
+    build_card_action_user_text,
+    extract_card_action_metadata,
+)
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -709,8 +713,8 @@ class GatewayRunner:
             logger.debug("SQLite session store not available: %s", e)
         
         # DM pairing store for code-based user authorization
-        from gateway.pairing import PairingStore
-        self.pairing_store = PairingStore()
+        from gateway.pairing import PairingStore, resolve_pairing_dir
+        self.pairing_store = PairingStore(base_dir=resolve_pairing_dir(_hermes_home))
         
         # Event hook system
         from gateway.hooks import HookRegistry
@@ -1177,7 +1181,7 @@ class GatewayRunner:
                 self._failed_platforms[adapter.platform] = {
                     "config": platform_config,
                     "attempts": 0,
-                    "next_retry": time.monotonic() + 30,
+                    "next_retry": time.monotonic() + 5,
                 }
                 logger.info(
                     "%s queued for background reconnection",
@@ -1193,22 +1197,10 @@ class GatewayRunner:
                 logger.error("No connected messaging platforms remain. Shutting down gateway cleanly.")
             await self.stop()
         elif not self.adapters and self._failed_platforms:
-            # All platforms are down and queued for background reconnection.
-            # If the error is retryable, exit with failure so systemd Restart=on-failure
-            # can restart the process. Otherwise stay alive and keep retrying in background.
-            if adapter.fatal_error_retryable:
-                self._exit_reason = adapter.fatal_error_message or "All messaging platforms failed with retryable errors"
-                self._exit_with_failure = True
-                logger.error(
-                    "All messaging platforms failed with retryable errors. "
-                    "Shutting down gateway for service restart (systemd will retry)."
-                )
-                await self.stop()
-            else:
-                logger.warning(
-                    "No connected messaging platforms remain, but %d platform(s) queued for reconnection",
-                    len(self._failed_platforms),
-                )
+            logger.warning(
+                "No connected messaging platforms remain, but %d platform(s) queued for reconnection",
+                len(self._failed_platforms),
+            )
 
     def _request_clean_exit(self, reason: str) -> None:
         self._exit_cleanly = True
@@ -1925,7 +1917,7 @@ class GatewayRunner:
         # Warn if no user allowlists are configured and open access is not opted in
         _any_allowlist = any(
             os.getenv(v)
-            for v in ("TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
+            for v in ("GRIX_ALLOWED_USERS", "TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
                        "WHATSAPP_ALLOWED_USERS", "SLACK_ALLOWED_USERS",
                        "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
                        "EMAIL_ALLOWED_USERS",
@@ -1941,7 +1933,7 @@ class GatewayRunner:
         )
         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
             os.getenv(v, "").lower() in ("true", "1", "yes")
-            for v in ("TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
+            for v in ("GRIX_ALLOW_ALL_USERS", "TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
                        "WHATSAPP_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS",
                        "SIGNAL_ALLOW_ALL_USERS", "EMAIL_ALLOW_ALL_USERS",
                        "SMS_ALLOW_ALL_USERS", "MATTERMOST_ALLOW_ALL_USERS",
@@ -2695,6 +2687,13 @@ class GatewayRunner:
                 getattr(self.config, "thread_sessions_per_user", False),
             )
 
+        if platform == Platform.GRIX:
+            from gateway.platforms.grix import GrixAdapter, check_grix_requirements
+            if not check_grix_requirements():
+                logger.warning("Grix: aiohttp not installed")
+                return None
+            return GrixAdapter(config)
+
         if platform == Platform.TELEGRAM:
             from gateway.platforms.telegram import TelegramAdapter, check_telegram_requirements
             if not check_telegram_requirements():
@@ -2859,6 +2858,7 @@ class GatewayRunner:
             return False
 
         platform_env_map = {
+            Platform.GRIX: "GRIX_ALLOWED_USERS",
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
             Platform.DISCORD: "DISCORD_ALLOWED_USERS",
             Platform.WHATSAPP: "WHATSAPP_ALLOWED_USERS",
@@ -2880,6 +2880,7 @@ class GatewayRunner:
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
         }
         platform_allow_all_map = {
+            Platform.GRIX: "GRIX_ALLOW_ALL_USERS",
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
             Platform.WHATSAPP: "WHATSAPP_ALLOW_ALL_USERS",
@@ -3097,13 +3098,21 @@ class GatewayRunner:
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        _quick_key = self._session_key_for_source(source)
+        card_action = extract_card_action_metadata(event.raw_message)
+        if card_action is not None:
+            event.text = build_card_action_user_text(
+                card_action.get("tag"),
+                card_action.get("value"),
+            )
+            event.message_type = MessageType.TEXT
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
         # .update_response so the update process can continue.
-        _quick_key = self._session_key_for_source(source)
         _update_prompts = getattr(self, "_update_prompt_pending", {})
-        if _update_prompts.get(_quick_key):
+        if _update_prompts.get(_quick_key) and card_action is None:
             raw = (event.text or "").strip()
             # Accept /approve and /deny as shorthand for yes/no
             cmd = event.get_command()
@@ -7541,7 +7550,7 @@ class GatewayRunner:
     # Platforms where /update is allowed.  ACP, API server, and webhooks are
     # programmatic interfaces that should not trigger system updates.
     _UPDATE_ALLOWED_PLATFORMS = frozenset({
-        Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
+        Platform.GRIX, Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
         Platform.SIGNAL, Platform.MATTERMOST, Platform.MATRIX,
         Platform.HOMEASSISTANT, Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
@@ -9826,6 +9835,9 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                approval_id = approval_data.get("approval_id", "")
+                approval_metadata = dict(_status_thread_metadata or {})
+                approval_metadata["approval_data"] = dict(approval_data or {})
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -9838,7 +9850,8 @@ class GatewayRunner:
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=approval_metadata,
+                                approval_id=approval_id,
                             ),
                             _loop_for_step,
                         ).result(timeout=15)

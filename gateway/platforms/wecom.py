@@ -67,24 +67,26 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.platforms.wecom_bridge import (
+    WECOM_CALLBACK_COMMANDS,
+    WECOM_CMD_EVENT_CALLBACK,
+    WECOM_CMD_PING,
+    WECOM_CMD_RESPONSE,
+    WECOM_CMD_SEND,
+    WECOM_CMD_SUBSCRIBE,
+    WECOM_CMD_UPLOAD_MEDIA_CHUNK,
+    WECOM_CMD_UPLOAD_MEDIA_FINISH,
+    WECOM_CMD_UPLOAD_MEDIA_INIT,
+    WECOM_NON_RESPONSE_COMMANDS,
+    build_wecom_frame,
+    ensure_wecom_success,
+    extract_wecom_req_id,
+    wecom_response_error,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com"
-
-APP_CMD_SUBSCRIBE = "aibot_subscribe"
-APP_CMD_CALLBACK = "aibot_msg_callback"
-APP_CMD_LEGACY_CALLBACK = "aibot_callback"
-APP_CMD_EVENT_CALLBACK = "aibot_event_callback"
-APP_CMD_SEND = "aibot_send_msg"
-APP_CMD_RESPONSE = "aibot_respond_msg"
-APP_CMD_PING = "ping"
-APP_CMD_UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
-APP_CMD_UPLOAD_MEDIA_CHUNK = "aibot_upload_media_chunk"
-APP_CMD_UPLOAD_MEDIA_FINISH = "aibot_upload_media_finish"
-
-CALLBACK_COMMANDS = {APP_CMD_CALLBACK, APP_CMD_LEGACY_CALLBACK}
-NON_RESPONSE_COMMANDS = CALLBACK_COMMANDS | {APP_CMD_EVENT_CALLBACK}
 
 MAX_MESSAGE_LENGTH = 4000
 CONNECT_TIMEOUT_SECONDS = 20.0
@@ -136,6 +138,18 @@ def _entry_matches(entries: List[str], target: str) -> bool:
         if normalized == "*" or normalized == normalized_target:
             return True
     return False
+
+
+def _normalize_optional_id(value: Any) -> Optional[str]:
+    """Return a trimmed identifier or ``None`` when absent."""
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def _opaque_wecom_message_id(seed: str) -> str:
+    """Build an internal fallback message id without exposing transport ids."""
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
+    return f"wecom-msg-{digest[:20]}"
 
 
 class WeComAdapter(BasePlatformAdapter):
@@ -309,9 +323,9 @@ class WeComAdapter(BasePlatformAdapter):
                 payload = self._parse_json(msg.data)
                 if not payload:
                     continue
-                if payload.get("cmd") == APP_CMD_PING:
+                if payload.get("cmd") == WECOM_CMD_PING:
                     continue
-                if self._payload_req_id(payload) == req_id:
+                if extract_wecom_req_id(payload) == req_id:
                     return payload
                 logger.debug("[%s] Ignoring pre-auth payload: %s", self.name, payload.get("cmd"))
             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
@@ -366,11 +380,7 @@ class WeComAdapter(BasePlatformAdapter):
                     continue
                 try:
                     await self._send_json(
-                        {
-                            "cmd": APP_CMD_PING,
-                            "headers": {"req_id": self._new_req_id("ping")},
-                            "body": {},
-                        }
+                        build_wecom_frame(WECOM_CMD_PING, self._new_req_id("ping"), {})
                     )
                 except Exception as exc:
                     logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
@@ -379,19 +389,19 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _dispatch_payload(self, payload: Dict[str, Any]) -> None:
         """Route inbound websocket payloads."""
-        req_id = self._payload_req_id(payload)
+        req_id = extract_wecom_req_id(payload)
         cmd = str(payload.get("cmd") or "")
 
-        if req_id and req_id in self._pending_responses and cmd not in NON_RESPONSE_COMMANDS:
+        if req_id and req_id in self._pending_responses and cmd not in WECOM_NON_RESPONSE_COMMANDS:
             future = self._pending_responses.get(req_id)
             if future and not future.done():
                 future.set_result(payload)
             return
 
-        if cmd in CALLBACK_COMMANDS:
+        if cmd in WECOM_CALLBACK_COMMANDS:
             await self._on_message(payload)
             return
-        if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
+        if cmd in {WECOM_CMD_PING, WECOM_CMD_EVENT_CALLBACK}:
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
@@ -418,7 +428,7 @@ class WeComAdapter(BasePlatformAdapter):
         future = asyncio.get_running_loop().create_future()
         self._pending_responses[req_id] = future
         try:
-            await self._send_json({"cmd": cmd, "headers": {"req_id": req_id}, "body": body})
+            await self._send_json(build_wecom_frame(cmd, req_id, body))
             response = await asyncio.wait_for(future, timeout=timeout)
             return response
         finally:
@@ -428,7 +438,7 @@ class WeComAdapter(BasePlatformAdapter):
         self,
         reply_req_id: str,
         body: Dict[str, Any],
-        cmd: str = APP_CMD_RESPONSE,
+        cmd: str = WECOM_CMD_RESPONSE,
         timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> Dict[str, Any]:
         """Send a reply frame correlated to an inbound callback req_id."""
@@ -442,9 +452,7 @@ class WeComAdapter(BasePlatformAdapter):
         future = asyncio.get_running_loop().create_future()
         self._pending_responses[normalized_req_id] = future
         try:
-            await self._send_json(
-                {"cmd": cmd, "headers": {"req_id": normalized_req_id}, "body": body}
-            )
+            await self._send_json(build_wecom_frame(cmd, normalized_req_id, body))
             response = await asyncio.wait_for(future, timeout=timeout)
             return response
         finally:
@@ -453,13 +461,6 @@ class WeComAdapter(BasePlatformAdapter):
     @staticmethod
     def _new_req_id(prefix: str) -> str:
         return f"{prefix}-{uuid.uuid4().hex}"
-
-    @staticmethod
-    def _payload_req_id(payload: Dict[str, Any]) -> str:
-        headers = payload.get("headers")
-        if isinstance(headers, dict):
-            return str(headers.get("req_id") or "")
-        return ""
 
     @staticmethod
     def _parse_json(raw: Any) -> Optional[Dict[str, Any]]:
@@ -480,11 +481,11 @@ class WeComAdapter(BasePlatformAdapter):
         if not isinstance(body, dict):
             return
 
-        msg_id = str(body.get("msgid") or self._payload_req_id(payload) or uuid.uuid4().hex)
-        if self._dedup.is_duplicate(msg_id):
+        msg_id = self._resolve_inbound_message_id(payload, body)
+        if self._is_duplicate(msg_id):
             logger.debug("[%s] Duplicate message %s ignored", self.name, msg_id)
             return
-        self._remember_reply_req_id(msg_id, self._payload_req_id(payload))
+        self._remember_reply_req_id(msg_id, extract_wecom_req_id(payload))
 
         sender = body.get("from") if isinstance(body.get("from"), dict) else {}
         sender_id = str(sender.get("userid") or "").strip()
@@ -615,6 +616,40 @@ class WeComAdapter(BasePlatformAdapter):
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+
+    @staticmethod
+    def _resolve_inbound_message_id(payload: Dict[str, Any], body: Dict[str, Any]) -> str:
+        """Resolve a stable inbound message id without leaking raw req_id values."""
+        native_message_id = _normalize_optional_id(body.get("msgid"))
+        if native_message_id:
+            return native_message_id
+
+        req_id = extract_wecom_req_id(payload)
+        if req_id:
+            return _opaque_wecom_message_id(f"req:{req_id}")
+
+        seed = json.dumps(
+            {"cmd": payload.get("cmd"), "body": body},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return _opaque_wecom_message_id(seed)
+
+    @staticmethod
+    def _extract_response_message_id(response: Dict[str, Any]) -> Optional[str]:
+        """Return a native downstream message id when the platform provides one."""
+        containers = [response]
+        body = response.get("body")
+        if isinstance(body, dict):
+            containers.append(body)
+
+        for container in containers:
+            for key in ("msgid", "message_id", "msg_id"):
+                message_id = _normalize_optional_id(container.get(key))
+                if message_id:
+                    return message_id
+        return None
 
     @staticmethod
     def _extract_text(body: Dict[str, Any]) -> Tuple[str, Optional[str]]:
@@ -980,20 +1015,6 @@ class WeComAdapter(BasePlatformAdapter):
         }
 
     @staticmethod
-    def _response_error(response: Dict[str, Any]) -> Optional[str]:
-        errcode = response.get("errcode", 0)
-        if errcode in (0, None):
-            return None
-        errmsg = str(response.get("errmsg") or "unknown error")
-        return f"WeCom errcode {errcode}: {errmsg}"
-
-    @classmethod
-    def _raise_for_wecom_error(cls, response: Dict[str, Any], operation: str) -> None:
-        error = cls._response_error(response)
-        if error:
-            raise RuntimeError(f"{operation} failed: {error}")
-
-    @staticmethod
     def _decrypt_file_bytes(encrypted_data: bytes, aes_key: str) -> bytes:
         if not encrypted_data:
             raise ValueError("encrypted_data is empty")
@@ -1133,7 +1154,7 @@ class WeComAdapter(BasePlatformAdapter):
             )
 
         init_response = await self._send_request(
-            APP_CMD_UPLOAD_MEDIA_INIT,
+            WECOM_CMD_UPLOAD_MEDIA_INIT,
             {
                 "type": media_type,
                 "filename": filename,
@@ -1142,7 +1163,7 @@ class WeComAdapter(BasePlatformAdapter):
                 "md5": hashlib.md5(data).hexdigest(),
             },
         )
-        self._raise_for_wecom_error(init_response, "media upload init")
+        ensure_wecom_success(init_response, "media upload init")
 
         init_body = init_response.get("body") if isinstance(init_response.get("body"), dict) else {}
         upload_id = str(init_body.get("upload_id") or "").strip()
@@ -1152,7 +1173,7 @@ class WeComAdapter(BasePlatformAdapter):
         for chunk_index, start in enumerate(range(0, total_size, UPLOAD_CHUNK_SIZE)):
             chunk = data[start : start + UPLOAD_CHUNK_SIZE]
             chunk_response = await self._send_request(
-                APP_CMD_UPLOAD_MEDIA_CHUNK,
+                WECOM_CMD_UPLOAD_MEDIA_CHUNK,
                 {
                     "upload_id": upload_id,
                     # Match the official SDK implementation, which currently uses 0-based chunk indexes.
@@ -1160,13 +1181,13 @@ class WeComAdapter(BasePlatformAdapter):
                     "base64_data": base64.b64encode(chunk).decode("ascii"),
                 },
             )
-            self._raise_for_wecom_error(chunk_response, f"media upload chunk {chunk_index}")
+            ensure_wecom_success(chunk_response, f"media upload chunk {chunk_index}")
 
         finish_response = await self._send_request(
-            APP_CMD_UPLOAD_MEDIA_FINISH,
+            WECOM_CMD_UPLOAD_MEDIA_FINISH,
             {"upload_id": upload_id},
         )
-        self._raise_for_wecom_error(finish_response, "media upload finish")
+        ensure_wecom_success(finish_response, "media upload finish")
 
         finish_body = finish_response.get("body") if isinstance(finish_response.get("body"), dict) else {}
         media_id = str(finish_body.get("media_id") or "").strip()
@@ -1181,14 +1202,14 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _send_media_message(self, chat_id: str, media_type: str, media_id: str) -> Dict[str, Any]:
         response = await self._send_request(
-            APP_CMD_SEND,
+            WECOM_CMD_SEND,
             {
                 "chatid": chat_id,
                 "msgtype": media_type,
                 media_type: {"media_id": media_id},
             },
         )
-        self._raise_for_wecom_error(response, "send media message")
+        ensure_wecom_success(response, "send media message")
         return response
 
     async def _send_reply_markdown(self, reply_req_id: str, content: str) -> Dict[str, Any]:
@@ -1215,7 +1236,7 @@ class WeComAdapter(BasePlatformAdapter):
                 media_type: {"media_id": media_id},
             },
         )
-        self._raise_for_wecom_error(response, "send reply media message")
+        ensure_wecom_success(response, "send reply media message")
         return response
 
     async def _send_followup_markdown(
@@ -1303,7 +1324,7 @@ class WeComAdapter(BasePlatformAdapter):
 
         return SendResult(
             success=True,
-            message_id=self._payload_req_id(media_response) or uuid.uuid4().hex[:12],
+            message_id=self._extract_response_message_id(media_response),
             raw_response={
                 "upload": upload_result,
                 "media": media_response,
@@ -1337,7 +1358,7 @@ class WeComAdapter(BasePlatformAdapter):
                 response = await self._send_reply_markdown(reply_req_id, content)
             else:
                 response = await self._send_request(
-                    APP_CMD_SEND,
+                    WECOM_CMD_SEND,
                     {
                         "chatid": chat_id,
                         "msgtype": "markdown",
@@ -1350,13 +1371,13 @@ class WeComAdapter(BasePlatformAdapter):
             logger.error("[%s] Send failed: %s", self.name, exc)
             return SendResult(success=False, error=str(exc))
 
-        error = self._response_error(response)
+        error = wecom_response_error(response)
         if error:
             return SendResult(success=False, error=error)
 
         return SendResult(
             success=True,
-            message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
+            message_id=self._extract_response_message_id(response),
             raw_response=response,
         )
 

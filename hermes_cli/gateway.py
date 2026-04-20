@@ -2014,6 +2014,32 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
 # and prompts needed to configure a messaging platform.
 _PLATFORMS = [
     {
+        "key": "grix",
+        "label": "Grix",
+        "emoji": "🧩",
+        "token_var": "GRIX_API_KEY",
+        "setup_instructions": [
+            "1. Prepare the aibot/Grix websocket endpoint URL",
+            "2. Copy the agent ID that should be used to authenticate Hermes",
+            "3. Copy the API key for that agent",
+            "4. If you want cron or notifications to go somewhere by default, decide the home session ID now",
+            "5. Allowed user IDs should match the protocol sender_id values from Grix",
+        ],
+        "vars": [
+            {"name": "GRIX_ENDPOINT", "prompt": "Websocket endpoint", "password": False,
+             "help": "Example: wss://your-grix-gateway.example/ws"},
+            {"name": "GRIX_AGENT_ID", "prompt": "Agent ID", "password": False,
+             "help": "The agent_id sent in the Grix auth packet."},
+            {"name": "GRIX_API_KEY", "prompt": "API key", "password": True,
+             "help": "The api_key sent in the Grix auth packet."},
+            {"name": "GRIX_ALLOWED_USERS", "prompt": "Allowed sender IDs (comma-separated)", "password": False,
+             "is_allowlist": True,
+             "help": "Use the sender_id values delivered by Grix inbound events."},
+            {"name": "GRIX_HOME_CHANNEL", "prompt": "Home session ID (optional)", "password": False,
+             "help": "Optional default session_id used for cron or send_message('grix')."},
+        ],
+    },
+    {
         "key": "telegram",
         "label": "Telegram",
         "emoji": "📱",

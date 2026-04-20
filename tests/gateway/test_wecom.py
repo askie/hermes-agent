@@ -10,6 +10,12 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SendResult
+from gateway.platforms.wecom_bridge import (
+    WECOM_CMD_SEND,
+    WECOM_CMD_UPLOAD_MEDIA_CHUNK,
+    WECOM_CMD_UPLOAD_MEDIA_FINISH,
+    WECOM_CMD_UPLOAD_MEDIA_INIT,
+)
 
 
 class TestWeComRequirements:
@@ -131,6 +137,7 @@ class TestWeComReplyMode:
         result = await adapter.send("chat-123", "hello from reply", reply_to="msg-1")
 
         assert result.success is True
+        assert result.message_id is None
         adapter._send_reply_request.assert_awaited_once()
         args = adapter._send_reply_request.await_args.args
         assert args[0] == "req-1"
@@ -166,6 +173,7 @@ class TestWeComReplyMode:
         result = await adapter.send_image_file("chat-123", "/tmp/demo.png", reply_to="msg-1")
 
         assert result.success is True
+        assert result.message_id is None
         adapter._send_reply_request.assert_awaited_once()
         args = adapter._send_reply_request.await_args.args
         assert args[0] == "req-1"
@@ -311,23 +319,18 @@ class TestMediaUpload:
     @pytest.mark.asyncio
     async def test_upload_media_bytes_uses_sdk_sequence(self, monkeypatch):
         import gateway.platforms.wecom as wecom_module
-        from gateway.platforms.wecom import (
-            APP_CMD_UPLOAD_MEDIA_CHUNK,
-            APP_CMD_UPLOAD_MEDIA_FINISH,
-            APP_CMD_UPLOAD_MEDIA_INIT,
-            WeComAdapter,
-        )
+        from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
         calls = []
 
         async def fake_send_request(cmd, body, timeout=0):
             calls.append((cmd, body))
-            if cmd == APP_CMD_UPLOAD_MEDIA_INIT:
+            if cmd == WECOM_CMD_UPLOAD_MEDIA_INIT:
                 return {"errcode": 0, "body": {"upload_id": "upload-1"}}
-            if cmd == APP_CMD_UPLOAD_MEDIA_CHUNK:
+            if cmd == WECOM_CMD_UPLOAD_MEDIA_CHUNK:
                 return {"errcode": 0}
-            if cmd == APP_CMD_UPLOAD_MEDIA_FINISH:
+            if cmd == WECOM_CMD_UPLOAD_MEDIA_FINISH:
                 return {
                     "errcode": 0,
                     "body": {
@@ -345,11 +348,11 @@ class TestMediaUpload:
 
         assert result["media_id"] == "media-1"
         assert [cmd for cmd, _body in calls] == [
-            APP_CMD_UPLOAD_MEDIA_INIT,
-            APP_CMD_UPLOAD_MEDIA_CHUNK,
-            APP_CMD_UPLOAD_MEDIA_CHUNK,
-            APP_CMD_UPLOAD_MEDIA_CHUNK,
-            APP_CMD_UPLOAD_MEDIA_FINISH,
+            WECOM_CMD_UPLOAD_MEDIA_INIT,
+            WECOM_CMD_UPLOAD_MEDIA_CHUNK,
+            WECOM_CMD_UPLOAD_MEDIA_CHUNK,
+            WECOM_CMD_UPLOAD_MEDIA_CHUNK,
+            WECOM_CMD_UPLOAD_MEDIA_FINISH,
         ]
         assert calls[1][1]["chunk_index"] == 0
         assert calls[2][1]["chunk_index"] == 1
@@ -426,7 +429,7 @@ class TestMediaUpload:
 class TestSend:
     @pytest.mark.asyncio
     async def test_send_uses_proactive_payload(self):
-        from gateway.platforms.wecom import APP_CMD_SEND, WeComAdapter
+        from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
         adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-1"}, "errcode": 0})
@@ -434,14 +437,29 @@ class TestSend:
         result = await adapter.send("chat-123", "Hello WeCom")
 
         assert result.success is True
+        assert result.message_id is None
         adapter._send_request.assert_awaited_once_with(
-            APP_CMD_SEND,
+            WECOM_CMD_SEND,
             {
                 "chatid": "chat-123",
                 "msgtype": "markdown",
                 "markdown": {"content": "Hello WeCom"},
             },
         )
+
+    @pytest.mark.asyncio
+    async def test_send_returns_native_message_id_when_wecom_provides_one(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._send_request = AsyncMock(
+            return_value={"errcode": 0, "body": {"msgid": "msg-200"}}
+        )
+
+        result = await adapter.send("chat-123", "Hello WeCom")
+
+        assert result.success is True
+        assert result.message_id == "msg-200"
 
     @pytest.mark.asyncio
     async def test_send_reports_wecom_errors(self):
@@ -493,6 +511,7 @@ class TestSend:
         result = await adapter.send_voice("chat-123", "/tmp/voice.mp3", caption="listen")
 
         assert result.success is True
+        assert result.message_id is None
         adapter._send_media_message.assert_awaited_once_with("chat-123", "file", "media-1")
         assert adapter.send.await_count == 2
         adapter.send.assert_any_await(chat_id="chat-123", content="listen", reply_to=None)
@@ -566,6 +585,34 @@ class TestInboundMessages:
         assert event.reply_to_message_id == "quote:msg-1"
 
     @pytest.mark.asyncio
+    async def test_on_message_uses_opaque_fallback_id_when_msgid_missing(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "hello"},
+            },
+        }
+
+        await adapter._on_message(payload)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_id.startswith("wecom-msg-")
+        assert event.message_id != "req-1"
+        assert "req-1" not in event.message_id
+        assert adapter._reply_req_ids[event.message_id] == "req-1"
+
+    @pytest.mark.asyncio
     async def test_on_message_respects_group_policy(self):
         from gateway.platforms.wecom import WeComAdapter
 
@@ -593,6 +640,32 @@ class TestInboundMessages:
 
         await adapter._on_message(payload)
         adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_on_message_ignores_duplicate_msgid(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "msg-dup-1",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "hello"},
+            },
+        }
+
+        await adapter._on_message(payload)
+        await adapter._on_message(payload)
+
+        adapter.handle_message.assert_awaited_once()
 
 
 class TestWeComZombieSessionFix:

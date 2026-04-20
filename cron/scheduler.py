@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
-    "telegram", "discord", "slack", "whatsapp", "signal",
+    "grix", "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot",
@@ -52,6 +52,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
 # Platforms that support a configured cron/notification home target, mapped to
 # the environment variable used by gateway setup/runtime config.
 _HOME_TARGET_ENV_VARS = {
+    "grix": "GRIX_HOME_CHANNEL",
     "matrix": "MATRIX_HOME_ROOM",
     "telegram": "TELEGRAM_HOME_CHANNEL",
     "discord": "DISCORD_HOME_CHANNEL",
@@ -285,6 +286,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from gateway.config import load_gateway_config, Platform
 
     platform_map = {
+        "grix": Platform.GRIX,
         "telegram": Platform.TELEGRAM,
         "discord": Platform.DISCORD,
         "slack": Platform.SLACK,

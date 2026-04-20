@@ -108,6 +108,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.platforms.card_actions import attach_card_action_metadata, build_card_action_command
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
 
@@ -1517,6 +1518,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        approval_id: Optional[str] = None,
     ) -> SendResult:
         """Send an interactive card with approval buttons.
 
@@ -2251,12 +2253,52 @@ class FeishuAdapter(BasePlatformAdapter):
         action_tag = str(getattr(action, "tag", "") or "button")
         action_value = getattr(action, "value", {}) or {}
 
-        synthetic_text = f"/card {action_tag}"
-        if action_value:
+        # --- Exec approval button intercept ---
+        hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
+        if hermes_action:
+            approval_id = action_value.get("approval_id")
+            state = self._approval_state.pop(approval_id, None)
+            if not state:
+                logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
+                return
+
+            choice_map = {
+                "approve_once": "once",
+                "approve_session": "session",
+                "approve_always": "always",
+                "deny": "deny",
+            }
+            choice = choice_map.get(hermes_action, "deny")
+
+            label_map = {
+                "once": "Approved once",
+                "session": "Approved for session",
+                "always": "Approved permanently",
+                "deny": "Denied",
+            }
+            label = label_map.get(choice, "Resolved")
+
+            # Resolve sender name for the status card
+            sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+            sender_profile = await self._resolve_sender_profile(sender_id)
+            user_name = sender_profile.get("user_name") or open_id
+
+            # Resolve the approval — unblocks the agent thread
             try:
-                synthetic_text += f" {json.dumps(action_value, ensure_ascii=False)}"
-            except Exception:
-                pass
+                from tools.approval import resolve_gateway_approval
+                count = resolve_gateway_approval(state["session_key"], choice)
+                logger.info(
+                    "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                    count, state["session_key"], choice, user_name,
+                )
+            except Exception as exc:
+                logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
+
+            # Update the card to show the decision
+            await self._update_approval_card(state.get("message_id", ""), label, user_name, choice)
+            return
+
+        synthetic_text = build_card_action_command(action_tag, action_value)
 
         sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
         sender_profile = await self._resolve_sender_profile(sender_id)
@@ -2274,7 +2316,12 @@ class FeishuAdapter(BasePlatformAdapter):
             text=synthetic_text,
             message_type=MessageType.COMMAND,
             source=source,
-            raw_message=data,
+            raw_message=attach_card_action_metadata(
+                data,
+                action_tag=action_tag,
+                action_value=action_value,
+                platform=self.platform.value,
+            ),
             message_id=token or str(uuid.uuid4()),
             timestamp=datetime.now(),
         )

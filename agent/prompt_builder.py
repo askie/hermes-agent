@@ -289,6 +289,12 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
 DEVELOPER_ROLE_MODELS = ("gpt-5", "codex")
 
 PLATFORM_HINTS = {
+    "grix": (
+        "You are on Grix, a plain-text chat bridge that speaks the aibot agent protocol. "
+        "Do not rely on markdown rendering, HTML, buttons, or native file uploads. "
+        "Write concise plain text replies that read well in direct chats and groups. "
+        "Threads may exist; stay on-topic for the current thread when one is present."
+    ),
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "
         "Please do not use markdown as it does not render. "
