@@ -1,0 +1,271 @@
+"""Tests for the project gateway launcher."""
+
+import json
+from pathlib import Path
+
+import hermes_cli.project_gateway_launcher as launcher
+
+
+def test_main_defaults_to_default_and_paired_profile(monkeypatch):
+    restarted = []
+
+    monkeypatch.setattr(
+        launcher,
+        "restart_gateways",
+        lambda targets: restarted.append(targets) or [],
+    )
+
+    assert launcher.main([]) == 0
+    assert restarted == [[None, "grix-agent"]]
+
+
+def test_main_with_profile_restarts_only_named_target(monkeypatch):
+    restarted = []
+
+    monkeypatch.setattr(
+        launcher,
+        "restart_gateways",
+        lambda targets: restarted.append(targets) or [],
+    )
+
+    assert launcher.main(["grix-agent"]) == 0
+    assert restarted == [["grix-agent"]]
+
+
+def test_build_targets_uses_override_for_paired_profile(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    paired = tmp_path / ".hermes" / "profiles" / "demo-agent"
+    paired.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_PROJECT_GATEWAY_PROFILE", "demo-agent")
+
+    assert launcher.build_targets(None) == [None, "demo-agent"]
+
+
+def test_build_targets_uses_managed_profile_registry(monkeypatch, tmp_path):
+    managed_file = tmp_path / ".hermes" / launcher.MANAGED_PROFILES_FILE
+    managed_file.parent.mkdir(parents=True)
+    managed_file.write_text(json.dumps({"profiles": ["alpha", "beta"]}), encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    assert launcher.build_targets(None) == [None, "alpha", "beta"]
+
+
+def test_parse_args_defaults_to_real_cli_argv(monkeypatch):
+    monkeypatch.setattr(
+        launcher.sys,
+        "argv",
+        [
+            "hermes-project-gateway",
+            "add",
+            "grix-online",
+            "--endpoint",
+            "wss://example.invalid/ws?agent_id=42",
+            "--agent-id",
+            "42",
+            "--api-key",
+            "ak-42",
+        ],
+    )
+
+    args = launcher.parse_args()
+
+    assert args.command == "add"
+    assert args.profile == "grix-online"
+    assert args.endpoint == "wss://example.invalid/ws?agent_id=42"
+    assert args.agent_id == "42"
+    assert args.api_key == "ak-42"
+
+
+def test_restart_gateways_stops_all_targets_before_starting(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(
+        launcher,
+        "stop_gateway",
+        lambda profile=None: events.append(("stop", profile)) or {},
+    )
+    monkeypatch.setattr(
+        launcher,
+        "start_gateway",
+        lambda profile=None: events.append(("start", profile)) or {},
+    )
+
+    assert launcher.restart_gateways([None, "grix-agent"]) == [{}, {}]
+    assert events == [
+        ("stop", None),
+        ("stop", "grix-agent"),
+        ("start", None),
+        ("start", "grix-agent"),
+    ]
+
+
+def test_start_gateway_uses_explicit_profile_home(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    captured = {}
+
+    class FakePopen:
+        def __init__(
+            self,
+            command,
+            *,
+            cwd,
+            env,
+            stdout,
+            stderr,
+            start_new_session,
+        ):
+            captured["command"] = command
+            captured["cwd"] = cwd
+            captured["env"] = env
+            captured["stderr"] = stderr
+            captured["start_new_session"] = start_new_session
+            captured["stdout_name"] = stdout.name
+            self.pid = 43210
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(launcher, "PROJECT_ROOT", repo_root)
+    monkeypatch.setattr(launcher, "get_project_python_path", lambda: "/fake/python")
+    monkeypatch.setattr(launcher, "gateway_is_running", lambda home: False)
+    monkeypatch.setattr(
+        launcher,
+        "wait_for_gateway_running",
+        lambda home, timeout_seconds=launcher.START_TIMEOUT_SECONDS: {
+            "gateway_state": "running"
+        },
+    )
+    monkeypatch.setattr(launcher.subprocess, "Popen", FakePopen)
+
+    result = launcher.start_gateway("grix-agent")
+
+    expected_home = tmp_path / ".hermes" / "profiles" / "grix-agent"
+    expected_log = expected_home / "logs" / "project-gateway-launcher.log"
+
+    assert captured["command"] == [
+        "/fake/python",
+        "-m",
+        "hermes_cli.main",
+        "gateway",
+        "run",
+    ]
+    assert captured["cwd"] == str(repo_root)
+    assert captured["env"]["HERMES_HOME"] == str(expected_home)
+    assert captured["stderr"] == launcher.subprocess.STDOUT
+    assert captured["start_new_session"] is True
+    assert captured["stdout_name"] == str(expected_log)
+    assert result["hermes_home"] == str(expected_home)
+
+
+def test_configure_grix_profile_overwrites_target_specific_env(tmp_path):
+    profile_dir = tmp_path / "profiles" / "online"
+    profile_dir.mkdir(parents=True)
+    env_path = profile_dir / ".env"
+    env_path.write_text(
+        "\n".join([
+            "GRIX_ALLOWED_USERS=legacy-user",
+            "GRIX_ALLOW_ALL_USERS=true",
+            "GRIX_HOME_CHANNEL=legacy-home",
+            "GRIX_HOME_CHANNEL_NAME=Legacy",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    launcher.configure_grix_profile(
+        profile_dir,
+        endpoint="wss://example.invalid/ws?agent_id=9001",
+        agent_id="9001",
+        api_key="ak-9001",
+    )
+
+    content = env_path.read_text(encoding="utf-8")
+    assert "GRIX_ENDPOINT=wss://example.invalid/ws?agent_id=9001" in content
+    assert "GRIX_AGENT_ID=9001" in content
+    assert "GRIX_API_KEY=ak-9001" in content
+    assert "GRIX_ALLOWED_USERS=" not in content
+    assert "GRIX_ALLOW_ALL_USERS=" not in content
+    assert "GRIX_HOME_CHANNEL=" not in content
+    assert "GRIX_HOME_CHANNEL_NAME=" not in content
+
+
+def test_add_managed_profile_registers_legacy_profile_and_restarts(monkeypatch, tmp_path):
+    existing_profile = tmp_path / ".hermes" / "profiles" / "grix-agent"
+    existing_profile.mkdir(parents=True)
+    new_profile_dir = tmp_path / ".hermes" / "profiles" / "grix-online"
+    new_profile_dir.mkdir(parents=True)
+
+    restarted = []
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        launcher,
+        "ensure_profile",
+        lambda profile, clone_from=None: (new_profile_dir, True),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "restart_gateways",
+        lambda targets: restarted.append(targets) or [{
+            "label": "profile 'grix-online'",
+            "hermes_home": str(new_profile_dir),
+            "log_path": str(new_profile_dir / "logs" / "project-gateway-launcher.log"),
+            "state": {"gateway_state": "running"},
+        }],
+    )
+
+    result = launcher.add_managed_profile(
+        "grix-online",
+        endpoint="wss://clawpool.example/ws?agent_id=2043",
+        agent_id="2043",
+        api_key="ak_2043_test",
+        allow_all_users=True,
+    )
+
+    assert restarted == [["grix-online"]]
+    assert result["created"] is True
+    assert result["managed_profiles"] == ["grix-agent", "grix-online"]
+
+    env_content = (new_profile_dir / ".env").read_text(encoding="utf-8")
+    assert "GRIX_ENDPOINT=wss://clawpool.example/ws?agent_id=2043" in env_content
+    assert "GRIX_AGENT_ID=2043" in env_content
+    assert "GRIX_API_KEY=ak_2043_test" in env_content
+    assert "GRIX_ALLOW_ALL_USERS=true" in env_content
+    assert "GRIX_ALLOWED_USERS=" not in env_content
+
+    registry = json.loads((tmp_path / ".hermes" / launcher.MANAGED_PROFILES_FILE).read_text(encoding="utf-8"))
+    assert registry == {"profiles": ["grix-agent", "grix-online"]}
+
+
+def test_stop_gateway_terminates_existing_process(monkeypatch, tmp_path):
+    expected_home = tmp_path / ".hermes"
+    pid_path = expected_home / "gateway.pid"
+    state_path = expected_home / "gateway_state.json"
+    pid_path.parent.mkdir(parents=True)
+    pid_path.write_text("12345", encoding="utf-8")
+    state_path.write_text('{"pid": 12345, "gateway_state": "running"}', encoding="utf-8")
+
+    signals = []
+    running = {"active": True}
+
+    def fake_kill(pid, sig):
+        signals.append((pid, sig))
+        if sig == launcher.signal.SIGTERM:
+            running["active"] = False
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(launcher.os, "kill", fake_kill)
+    monkeypatch.setattr(
+        launcher,
+        "process_is_running",
+        lambda pid: running["active"],
+    )
+
+    result = launcher.stop_gateway()
+
+    assert signals == [(12345, launcher.signal.SIGTERM)]
+    assert result["was_running"] is True
+    assert result["pid"] == 12345
+    assert not pid_path.exists()
+    assert not state_path.exists()
