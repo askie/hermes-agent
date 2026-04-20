@@ -26,6 +26,7 @@ from gateway.platforms.aibot_contract import (
     ERR_UNSUPPORTED_LOCAL_ACTION,
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
+    LOCAL_ACTION_FILE_LIST,
     STATUS_ALREADY_FINISHED,
     STATUS_FAILED,
     STATUS_OK,
@@ -735,6 +736,10 @@ class GrixAdapter(BasePlatformAdapter):
             )
             return
 
+        if action.action_type == LOCAL_ACTION_FILE_LIST:
+            await self._handle_file_list(action)
+            return
+
         if action.action_type not in {LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT}:
             await self._client.send_local_action_result(
                 action_id=action.action_id,
@@ -786,6 +791,24 @@ class GrixAdapter(BasePlatformAdapter):
             action_id=action.action_id,
             status=STATUS_OK,
             result=decision_value or approval_choice,
+        )
+
+    async def _handle_file_list(self, action: GrixLocalAction) -> None:
+        from gateway.platforms.grix_file_list import handle_file_list_action, real_home_dir
+
+        if not self._client:
+            return
+        result = handle_file_list_action(
+            action.params,
+            resolve_cwd=lambda _sid: None,
+            fallback_dir=real_home_dir(),
+        )
+        await self._client.send_local_action_result(
+            action_id=action.action_id,
+            status=result["status"],
+            result=result.get("result"),
+            error_code=result.get("error_code"),
+            error_message=result.get("error_msg"),
         )
 
     async def _handle_message_packet(self, payload: Dict[str, Any]) -> None:
