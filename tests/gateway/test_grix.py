@@ -1123,6 +1123,47 @@ class TestGrixAdapter:
         }
 
     @pytest.mark.asyncio
+    async def test_send_splits_long_utf8_content_and_keeps_metadata_on_first_chunk(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        result = await adapter.send(
+            chat_id="g_1001:topic-a",
+            content="使用流程：请分步骤说明。" * 260,
+            reply_to="msg-1",
+            metadata={
+                "event_id": "evt-1",
+                "biz_card": {"type": "demo"},
+                "channel_data": {"source": "test"},
+            },
+        )
+
+        assert result.success is True
+        assert len(fake_client.sent) > 1
+        assert all(
+            len(message["text"].encode("utf-8")) <= adapter.MAX_MESSAGE_LENGTH
+            for message in fake_client.sent
+        )
+        assert fake_client.sent[0]["reply_to_message_id"] == "msg-1"
+        assert fake_client.sent[0]["event_id"] == "evt-1"
+        assert fake_client.sent[0]["biz_card"] == {"type": "demo"}
+        assert fake_client.sent[0]["channel_data"] == {"source": "test"}
+        assert all(message["thread_id"] == "topic-a" for message in fake_client.sent)
+        assert all(message["reply_to_message_id"] is None for message in fake_client.sent[1:])
+        assert all(message["event_id"] is None for message in fake_client.sent[1:])
+        assert all(message["biz_card"] is None for message in fake_client.sent[1:])
+        assert all(message["channel_data"] is None for message in fake_client.sent[1:])
+        assert fake_client.completed_events[0]["event_id"] == "evt-1"
+        assert fake_client.completed_events[0]["status"] == STATUS_RESPONDED
+
+    @pytest.mark.asyncio
     async def test_edit_message_accepts_finalize_kwarg_and_calls_transport_edit(self):
         adapter = GrixAdapter(
             PlatformConfig(

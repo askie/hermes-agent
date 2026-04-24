@@ -269,7 +269,7 @@ async def resolve_grix_target(
 
 class GrixAdapter(BasePlatformAdapter):
     platform = Platform.GRIX
-    MAX_MESSAGE_LENGTH = 4000
+    MAX_MESSAGE_LENGTH = 1800
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.GRIX)
@@ -290,6 +290,10 @@ class GrixAdapter(BasePlatformAdapter):
 
     def format_message(self, content: str) -> str:
         return content
+
+    @staticmethod
+    def _message_size(content: str) -> int:
+        return len(content.encode("utf-8"))
 
     def _schedule_session_route_bind(self, *, session_key: str, session_id: str) -> None:
         client = self._client
@@ -415,20 +419,30 @@ class GrixAdapter(BasePlatformAdapter):
         channel_data = _clone_metadata_object(metadata, "channel_data")
 
         try:
-            receipt = await self._client.send_text(
-                str(session_id),
+            chunks = self.truncate_message(
                 self.format_message(content),
-                reply_to_message_id=reply_to,
-                thread_id=thread_id,
-                event_id=event_id,
-                biz_card=biz_card,
-                channel_data=channel_data,
+                self.MAX_MESSAGE_LENGTH,
+                len_fn=self._message_size,
             )
+            receipt = None
+            for index, chunk in enumerate(chunks):
+                is_first = index == 0
+                receipt = await self._client.send_text(
+                    str(session_id),
+                    chunk,
+                    reply_to_message_id=reply_to if is_first else None,
+                    thread_id=thread_id,
+                    event_id=event_id if is_first else None,
+                    biz_card=biz_card if is_first else None,
+                    channel_data=channel_data if is_first else None,
+                )
+                if len(chunks) > 1 and index < len(chunks) - 1:
+                    await asyncio.sleep(0.2)
             if event_id:
                 await self._complete_event_if_needed(event_id, status=STATUS_RESPONDED)
             return SendResult(
-                success=bool(receipt.get("ok")),
-                message_id=receipt.get("message_id"),
+                success=bool(receipt and receipt.get("ok")),
+                message_id=receipt.get("message_id") if receipt else None,
                 raw_response=receipt,
                 retryable=False,
             )
