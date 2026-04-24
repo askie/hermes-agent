@@ -156,6 +156,7 @@ class TestEditMessageFinalizeSignature:
             ("gateway.platforms.feishu", "FeishuAdapter"),
             ("gateway.platforms.whatsapp", "WhatsAppAdapter"),
             ("gateway.platforms.dingtalk", "DingTalkAdapter"),
+            ("gateway.platforms.grix", "GrixAdapter"),
         ],
     )
     def test_edit_message_accepts_finalize(self, module_path, class_name):

@@ -1123,6 +1123,32 @@ class TestGrixAdapter:
         }
 
     @pytest.mark.asyncio
+    async def test_edit_message_accepts_finalize_kwarg_and_calls_transport_edit(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        result = await adapter.edit_message(
+            chat_id="g_1001",
+            message_id="out-1",
+            content="updated content",
+            finalize=True,
+        )
+
+        assert result.success is True
+        assert result.message_id == "out-1"
+        assert fake_client.edits[0]["session_id"] == "g_1001"
+        assert fake_client.edits[0]["message_id"] == "out-1"
+        assert fake_client.edits[0]["text"] == "updated content"
+        assert "finalize" not in fake_client.edits[0]
+
+    @pytest.mark.asyncio
     async def test_send_exec_approval_emits_structured_card_payload(self):
         adapter = GrixAdapter(
             PlatformConfig(

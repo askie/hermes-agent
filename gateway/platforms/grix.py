@@ -515,7 +515,12 @@ class GrixAdapter(BasePlatformAdapter):
         chat_id: str,
         message_id: str,
         content: str,
+        *,
+        finalize: bool = False,
     ) -> SendResult:
+        # Grix follows the current edit_msg contract; finalize is accepted so
+        # stream_consumer can call this adapter with a uniform signature.
+        _ = finalize
         if not self._client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
         try:
