@@ -489,6 +489,11 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _platform_value(platform: Any) -> str:
+    """Return a stable string for Platform enums and enum-like test doubles."""
+    return str(getattr(platform, "value", platform) or "")
+
+
 def _load_gateway_config() -> dict:
     """Load and parse ~/.hermes/config.yaml, returning {} on any error."""
     try:
@@ -1551,9 +1556,15 @@ class GatewayRunner:
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).
         from gateway.platforms.base import merge_pending_message_event
-        merge_pending_message_event(adapter._pending_messages, session_key, event)
+        is_grix = _platform_value(getattr(event.source, "platform", None)) == Platform.GRIX.value
+        merge_pending_message_event(
+            adapter._pending_messages,
+            session_key,
+            event,
+            merge_text=is_grix and event.message_type == MessageType.TEXT,
+        )
 
-        is_queue_mode = self._busy_input_mode == "queue"
+        is_queue_mode = self._busy_input_mode == "queue" or is_grix
 
         # If not in queue mode, interrupt the running agent immediately.
         # This aborts in-flight tool calls and causes the agent loop to exit
@@ -3526,6 +3537,16 @@ class GatewayRunner:
                     if self._queue_during_drain_enabled()
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
+            if _platform_value(source.platform) == Platform.GRIX.value:
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    merge_pending_message_event(
+                        adapter._pending_messages,
+                        _quick_key,
+                        event,
+                        merge_text=event.message_type == MessageType.TEXT,
+                    )
+                return "Queued for the next turn."
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)
             if _quick_key in self._pending_messages:
@@ -4538,6 +4559,25 @@ class GatewayRunner:
                 channel_prompt=event.channel_prompt,
             )
 
+            _message_adapter = self.adapters.get(source.platform)
+            if (
+                event.message_id
+                and _message_adapter
+                and hasattr(_message_adapter, "is_message_revoked")
+                and _message_adapter.is_message_revoked(session_key, event.message_id)
+            ):
+                logger.info(
+                    "Discarding revoked Grix turn for session %s message %s",
+                    session_key[:20] if session_key else "?",
+                    event.message_id,
+                )
+                try:
+                    self.session_store.rewrite_transcript(session_entry.session_id, history)
+                    self.session_store.update_session(session_key, last_prompt_tokens=0)
+                except Exception as exc:
+                    logger.debug("Failed to roll back revoked Grix turn: %s", exc)
+                return None
+
             # Stop persistent typing indicator now that the agent is done
             try:
                 _typing_adapter = self.adapters.get(source.platform)
@@ -4769,9 +4809,20 @@ class GatewayRunner:
                 
                 # If no new messages found (edge case), fall back to simple user/assistant
                 if not new_messages:
+                    user_entry = {"role": "user", "content": message_text, "timestamp": ts}
+                    if _platform_value(source.platform) == Platform.GRIX.value:
+                        user_entry.update({
+                            "_grix_kind": "message",
+                            "grix_message_id": event.message_id,
+                            "grix_event_id": (
+                                event.raw_message.get("event_id")
+                                if isinstance(event.raw_message, dict)
+                                else None
+                            ),
+                        })
                     self.session_store.append_to_transcript(
                         session_entry.session_id,
-                        {"role": "user", "content": message_text, "timestamp": ts}
+                        user_entry,
                     )
                     if response:
                         self.session_store.append_to_transcript(
@@ -4790,6 +4841,16 @@ class GatewayRunner:
                             continue
                         # Add timestamp to each message for debugging
                         entry = {**msg, "timestamp": ts}
+                        if (
+                            _platform_value(source.platform) == Platform.GRIX.value
+                            and msg.get("role") == "user"
+                            and event.message_id
+                            and "grix_message_id" not in entry
+                        ):
+                            entry["_grix_kind"] = "message"
+                            entry["grix_message_id"] = event.message_id
+                            if isinstance(event.raw_message, dict):
+                                entry["grix_event_id"] = event.raw_message.get("event_id")
                         self.session_store.append_to_transcript(
                             session_entry.session_id, entry,
                             skip_db=agent_persisted,

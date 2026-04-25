@@ -174,6 +174,9 @@ class FakeSessionStore:
         self.session_key = session_key
         self.appended = []
         self.sources = []
+        self.transcript = []
+        self.rewritten = None
+        self.updated = []
 
     def get_or_create_session(self, source):
         self.sources.append(source)
@@ -187,6 +190,16 @@ class FakeSessionStore:
                 "skip_db": skip_db,
             }
         )
+
+    def load_transcript(self, session_id: str):
+        return list(self.transcript)
+
+    def rewrite_transcript(self, session_id: str, messages: list[dict]):
+        self.rewritten = {"session_id": session_id, "messages": list(messages)}
+        self.transcript = list(messages)
+
+    def update_session(self, session_key: str, **kwargs):
+        self.updated.append((session_key, kwargs))
 
 
 class TestGrixConfig:
@@ -1468,4 +1481,167 @@ class TestGrixAdapter:
         assert session_key not in adapter._pending_messages
         assert ("g_1001", "55") not in adapter._reply_event_ids
         assert fake_client.acknowledged_events[0]["event_id"] == "evt-revoke-1"
+        assert fake_client.completed_events == []
+
+    @pytest.mark.asyncio
+    async def test_event_revoke_interrupts_active_message_without_completion(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+        source = adapter.build_source(
+            chat_id="g_1001",
+            chat_type="group",
+            user_id="u_8",
+            user_name="alice",
+            thread_id="topic-a",
+        )
+        session_key = build_session_key(source)
+        adapter._message_sources[("g_1001", "55")] = source
+        adapter._message_session_keys[("g_1001", "55")] = session_key
+        adapter._processing_message_ids[session_key] = "55"
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        await adapter._handle_protocol_packet(
+            {
+                "cmd": "event_revoke",
+                "seq": 0,
+                "payload": {
+                    "event_id": "evt-revoke-active",
+                    "session_id": "g_1001",
+                    "session_type": 2,
+                    "thread_id": "topic-a",
+                    "msg_id": "55",
+                    "sender_id": "u_8",
+                    "is_revoked": True,
+                },
+            }
+        )
+
+        assert adapter._active_sessions[session_key].is_set()
+        assert adapter.is_message_revoked(session_key, "55") is True
+
+        event = MessageEvent(
+            text="old text",
+            source=source,
+            raw_message={"_grix_kind": "message", "event_id": "evt-original"},
+            message_id="55",
+        )
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        assert adapter.is_message_revoked(session_key, "55") is False
+        assert fake_client.acknowledged_events[0]["event_id"] == "evt-revoke-active"
+        assert fake_client.completed_events == []
+
+    @pytest.mark.asyncio
+    async def test_event_revoke_rewinds_last_completed_grix_turn(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+        session_store = FakeSessionStore()
+        session_store.transcript = [
+            {"role": "user", "content": "earlier", "grix_message_id": "44"},
+            {"role": "assistant", "content": "earlier response"},
+            {"role": "user", "content": "remove me", "grix_message_id": "55"},
+            {"role": "assistant", "content": "remove response"},
+        ]
+        adapter.set_session_store(session_store)
+        source = adapter.build_source(
+            chat_id="g_1001",
+            chat_type="group",
+            user_id="u_8",
+            user_name="alice",
+            thread_id="topic-a",
+        )
+        session_key = build_session_key(source)
+        adapter._message_sources[("g_1001", "55")] = source
+        adapter._message_session_keys[("g_1001", "55")] = session_key
+
+        await adapter._handle_protocol_packet(
+            {
+                "cmd": "event_revoke",
+                "seq": 0,
+                "payload": {
+                    "event_id": "evt-revoke-completed",
+                    "session_id": "g_1001",
+                    "session_type": 2,
+                    "thread_id": "topic-a",
+                    "msg_id": "55",
+                    "sender_id": "u_8",
+                    "is_revoked": True,
+                },
+            }
+        )
+
+        assert session_store.rewritten == {
+            "session_id": "sess-1",
+            "messages": [
+                {"role": "user", "content": "earlier", "grix_message_id": "44"},
+                {"role": "assistant", "content": "earlier response"},
+            ],
+        }
+        assert session_store.updated == [(session_key, {"last_prompt_tokens": 0})]
+        assert fake_client.acknowledged_events[0]["event_id"] == "evt-revoke-completed"
+        assert fake_client.completed_events == []
+
+    @pytest.mark.asyncio
+    async def test_event_revoke_does_not_rewrite_non_last_history_message(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+        session_store = FakeSessionStore()
+        session_store.transcript = [
+            {"role": "user", "content": "older", "grix_message_id": "55"},
+            {"role": "assistant", "content": "older response"},
+            {"role": "user", "content": "newer", "grix_message_id": "66"},
+            {"role": "assistant", "content": "newer response"},
+        ]
+        adapter.set_session_store(session_store)
+        source = adapter.build_source(
+            chat_id="g_1001",
+            chat_type="group",
+            user_id="u_8",
+            user_name="alice",
+            thread_id="topic-a",
+        )
+        session_key = build_session_key(source)
+        adapter._message_sources[("g_1001", "55")] = source
+        adapter._message_session_keys[("g_1001", "55")] = session_key
+
+        await adapter._handle_protocol_packet(
+            {
+                "cmd": "event_revoke",
+                "seq": 0,
+                "payload": {
+                    "event_id": "evt-revoke-old",
+                    "session_id": "g_1001",
+                    "session_type": 2,
+                    "thread_id": "topic-a",
+                    "msg_id": "55",
+                    "sender_id": "u_8",
+                    "is_revoked": True,
+                },
+            }
+        )
+
+        assert session_store.rewritten is None
+        assert session_store.transcript[-2]["grix_message_id"] == "66"
+        assert fake_client.acknowledged_events[0]["event_id"] == "evt-revoke-old"
         assert fake_client.completed_events == []

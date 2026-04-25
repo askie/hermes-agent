@@ -32,6 +32,7 @@ from gateway.platforms.base import (
     SessionSource,
     build_session_key,
 )
+from gateway.config import Platform
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +158,45 @@ class TestBusySessionAck:
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
         assert "Queued for the next turn" in content
         assert "respond once the current task finishes" in content
+        assert "Interrupting" not in content
+
+    @pytest.mark.asyncio
+    async def test_grix_busy_message_queues_without_interrupt_even_in_default_mode(self):
+        """Grix follow-up text should append as the next turn, not interrupt."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="grix")
+
+        event1 = _make_event(text="first follow-up", chat_id="g_1", platform_val="grix")
+        event1.source.platform = Platform.GRIX
+        event2 = MessageEvent(
+            text="second follow-up",
+            message_type=MessageType.TEXT,
+            source=event1.source,
+            message_id="msg2",
+        )
+        sk = build_session_key(event1.source)
+        runner.adapters[Platform.GRIX] = adapter
+
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 3,
+            "max_iterations": 90,
+            "current_tool": "terminal",
+            "last_activity_ts": time.time(),
+            "last_activity_desc": "terminal",
+            "seconds_since_activity": 1.0,
+        }
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time()
+
+        await runner._handle_active_session_busy_message(event1, sk)
+        await runner._handle_active_session_busy_message(event2, sk)
+
+        agent.interrupt.assert_not_called()
+        assert adapter._pending_messages[sk].text == "first follow-up\nsecond follow-up"
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Queued for the next turn" in content
         assert "Interrupting" not in content
 
     @pytest.mark.asyncio

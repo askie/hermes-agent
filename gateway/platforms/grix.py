@@ -287,6 +287,8 @@ class GrixAdapter(BasePlatformAdapter):
         self._message_sources: Dict[tuple[str, str], Any] = {}
         self._message_session_keys: Dict[tuple[str, str], str] = {}
         self._approval_state: Dict[str, Dict[str, Optional[str]]] = {}
+        self._processing_message_ids: Dict[str, str] = {}
+        self._revoked_message_keys: set[tuple[str, str]] = set()
 
     def format_message(self, content: str) -> str:
         return content
@@ -604,6 +606,23 @@ class GrixAdapter(BasePlatformAdapter):
         raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
         if raw_message.get("_grix_kind") != "message":
             return
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        message_id = str(event.message_id or "").strip()
+        if message_id and self._processing_message_ids.get(session_key) == message_id:
+            self._processing_message_ids.pop(session_key, None)
+        if message_id and self.is_message_revoked(session_key, message_id):
+            self._revoked_message_keys.discard((session_key, message_id))
+            logger.debug(
+                "[%s] Skipping completion for revoked GRIX message %s/%s",
+                self.name,
+                event.source.chat_id,
+                message_id,
+            )
+            return
         event_id = raw_message.get("event_id")
         if not isinstance(event_id, str) or not event_id.strip():
             return
@@ -612,6 +631,23 @@ class GrixAdapter(BasePlatformAdapter):
         status = STATUS_RESPONDED if is_success else STATUS_FAILED
         message = None if is_success else "message processing failed"
         await self._complete_event_if_needed(event_id.strip(), status=status, message=message)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
+        if raw_message.get("_grix_kind") != "message" or not event.message_id:
+            return
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        self._processing_message_ids[session_key] = str(event.message_id)
+
+    def is_message_revoked(self, session_key: str, message_id: str) -> bool:
+        normalized_message_id = str(message_id or "").strip()
+        if not session_key or not normalized_message_id:
+            return False
+        return (session_key, normalized_message_id) in self._revoked_message_keys
 
     def _build_record_only_attachment_summary(self, message: GrixInboundMessage) -> str:
         attachments = list(message.attachments or [])
@@ -917,6 +953,8 @@ class GrixAdapter(BasePlatformAdapter):
         )
 
         try:
+            if session_key not in self._active_sessions and message.message_id:
+                self._processing_message_ids[session_key] = message.message_id
             await self.handle_message(event)
         except Exception as exc:
             if self._client:
@@ -959,6 +997,93 @@ class GrixAdapter(BasePlatformAdapter):
             edit.message_id,
         )
 
+    def _load_revoke_transcript(self, session_store: Any, session_id: str) -> list[Dict[str, Any]]:
+        if hasattr(session_store, "get_transcript_path"):
+            try:
+                transcript_path = session_store.get_transcript_path(session_id)
+                if transcript_path.exists():
+                    messages: list[Dict[str, Any]] = []
+                    with open(transcript_path, encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                messages.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                logger.debug(
+                                    "[%s] Skipping corrupt transcript line while handling revoke",
+                                    self.name,
+                                )
+                    if messages:
+                        return messages
+            except Exception as exc:
+                logger.debug("[%s] Could not load JSONL transcript for revoke: %s", self.name, exc)
+
+        if hasattr(session_store, "load_transcript"):
+            try:
+                return list(session_store.load_transcript(session_id) or [])
+            except Exception as exc:
+                logger.debug("[%s] Could not load transcript for revoke: %s", self.name, exc)
+        return []
+
+    def _undo_last_completed_message_if_match(
+        self,
+        *,
+        source: Any,
+        session_key: Optional[str],
+        message_id: str,
+    ) -> bool:
+        session_store = getattr(self, "_session_store", None)
+        if session_store is None or source is None:
+            return False
+        if not hasattr(session_store, "get_or_create_session") or not hasattr(session_store, "rewrite_transcript"):
+            return False
+
+        try:
+            session_entry = session_store.get_or_create_session(source)
+        except Exception as exc:
+            logger.debug("[%s] Could not resolve session for revoke undo: %s", self.name, exc)
+            return False
+
+        history = self._load_revoke_transcript(session_store, session_entry.session_id)
+        last_user_idx = None
+        for idx in range(len(history) - 1, -1, -1):
+            if history[idx].get("role") == "user":
+                last_user_idx = idx
+                break
+        if last_user_idx is None:
+            return False
+
+        last_user = history[last_user_idx]
+        last_message_id = str(
+            last_user.get("grix_message_id")
+            or last_user.get("message_id")
+            or ""
+        ).strip()
+        if last_message_id != str(message_id or "").strip():
+            logger.debug(
+                "[%s] GRIX revoke for %s did not match last user turn (%s); leaving history unchanged",
+                self.name,
+                message_id,
+                last_message_id or "none",
+            )
+            return False
+
+        session_store.rewrite_transcript(session_entry.session_id, history[:last_user_idx])
+        if hasattr(session_store, "update_session") and session_key:
+            try:
+                session_store.update_session(session_key, last_prompt_tokens=0)
+            except Exception:
+                pass
+        logger.info(
+            "[%s] Rewound last completed GRIX turn for session %s message %s",
+            self.name,
+            getattr(session_entry, "session_id", "?"),
+            message_id,
+        )
+        return True
+
     async def _handle_revoke_packet(self, payload: Dict[str, Any]) -> None:
         revoke: GrixRevokeEvent = normalize_revoke_event(payload)
         source = self._message_sources.get((revoke.session_id, revoke.message_id))
@@ -986,8 +1111,37 @@ class GrixAdapter(BasePlatformAdapter):
                 revoke.session_id,
                 revoke.message_id,
             )
+        elif session_key and self._processing_message_ids.get(session_key) == revoke.message_id:
+            self._revoked_message_keys.add((session_key, revoke.message_id))
+            interrupt_event = self._active_sessions.get(session_key)
+            if interrupt_event is not None:
+                interrupt_event.set()
+            try:
+                await self.stop_typing(revoke.session_id)
+            except Exception:
+                pass
+            logger.info(
+                "[%s] Marked active GRIX message revoked for %s/%s",
+                self.name,
+                revoke.session_id,
+                revoke.message_id,
+            )
+            if source is not None:
+                self._undo_last_completed_message_if_match(
+                    source=source,
+                    session_key=session_key,
+                    message_id=revoke.message_id,
+                )
+        elif source is not None:
+            self._undo_last_completed_message_if_match(
+                source=source,
+                session_key=session_key,
+                message_id=revoke.message_id,
+            )
 
         self._reply_event_ids.pop((revoke.session_id, revoke.message_id), None)
+        self._message_sources.pop((revoke.session_id, revoke.message_id), None)
+        self._message_session_keys.pop((revoke.session_id, revoke.message_id), None)
 
     async def _handle_stop_packet(self, payload: Dict[str, Any]) -> None:
         stop = normalize_stop_event(payload)

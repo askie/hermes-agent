@@ -2099,6 +2099,19 @@ class BasePlatformAdapter(ABC):
                     session_key,
                 )
                 response = None
+            if (
+                response
+                and event.message_id
+                and hasattr(self, "is_message_revoked")
+                and self.is_message_revoked(session_key, event.message_id)
+            ):
+                logger.info(
+                    "[%s] Suppressing response for revoked message %s in session %s",
+                    self.name,
+                    event.message_id,
+                    session_key,
+                )
+                response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:

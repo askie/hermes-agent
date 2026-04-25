@@ -47,3 +47,32 @@ async def test_handle_message_does_not_priority_interrupt_photo_followup():
     assert result is None
     running_agent.interrupt.assert_not_called()
     assert runner.adapters[Platform.TELEGRAM]._pending_messages[session_key] is event
+
+
+@pytest.mark.asyncio
+async def test_handle_message_does_not_priority_interrupt_grix_followup():
+    runner = _make_runner()
+    runner.adapters[Platform.GRIX] = _PendingAdapter()
+    source = SessionSource(platform=Platform.GRIX, chat_id="g_1001", chat_type="dm", user_id="u1")
+    session_key = build_session_key(source)
+    running_agent = MagicMock()
+    runner._running_agents[session_key] = running_agent
+    runner.adapters[Platform.GRIX]._pending_messages[session_key] = MessageEvent(
+        text="first",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m1",
+    )
+
+    event = MessageEvent(
+        text="second",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m2",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "Queued for the next turn."
+    running_agent.interrupt.assert_not_called()
+    assert runner.adapters[Platform.GRIX]._pending_messages[session_key].text == "first\nsecond"
