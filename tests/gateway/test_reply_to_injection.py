@@ -115,9 +115,9 @@ async def test_no_prefix_without_reply_context():
 
 
 @pytest.mark.asyncio
-async def test_no_prefix_when_reply_to_text_is_empty():
-    """reply_to_message_id alone without text (e.g. a reply to a media-only
-    message) should not produce an empty `[Replying to: ""]` prefix."""
+async def test_reply_id_prefix_injected_when_reply_text_is_empty():
+    """When quoted text is unavailable, Hermes should still surface the
+    explicit reply target to the agent via the referenced message id."""
     runner = _make_runner()
     source = _source()
     event = MessageEvent(
@@ -133,7 +133,7 @@ async def test_no_prefix_when_reply_to_text_is_empty():
         history=[],
     )
 
-    assert result == "hi"
+    assert result == "[Replying to message id: 42]\n\nhi"
 
 
 @pytest.mark.asyncio

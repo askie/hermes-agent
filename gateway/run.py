@@ -4027,15 +4027,18 @@ class GatewayRunner:
                     )
                 message_text = f"{context_note}\n\n{message_text}"
 
-        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
+        if event.reply_to_message_id:
             # Always inject the reply-to pointer — even when the quoted text
             # already appears in history. The prefix isn't deduplication, it's
             # disambiguation: it tells the agent *which* prior message the user
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
-            message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+            if getattr(event, "reply_to_text", None):
+                reply_snippet = event.reply_to_text[:500]
+                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+            else:
+                message_text = f"[Replying to message id: {event.reply_to_message_id}]\n\n{message_text}"
 
         if "@" in message_text:
             try:
@@ -4810,6 +4813,8 @@ class GatewayRunner:
                 # If no new messages found (edge case), fall back to simple user/assistant
                 if not new_messages:
                     user_entry = {"role": "user", "content": message_text, "timestamp": ts}
+                    if event.reply_to_message_id:
+                        user_entry["reply_to_message_id"] = event.reply_to_message_id
                     if _platform_value(source.platform) == Platform.GRIX.value:
                         user_entry.update({
                             "_grix_kind": "message",
@@ -4851,6 +4856,12 @@ class GatewayRunner:
                             entry["grix_message_id"] = event.message_id
                             if isinstance(event.raw_message, dict):
                                 entry["grix_event_id"] = event.raw_message.get("event_id")
+                        if (
+                            msg.get("role") == "user"
+                            and event.reply_to_message_id
+                            and "reply_to_message_id" not in entry
+                        ):
+                            entry["reply_to_message_id"] = event.reply_to_message_id
                         self.session_store.append_to_transcript(
                             session_entry.session_id, entry,
                             skip_db=agent_persisted,
