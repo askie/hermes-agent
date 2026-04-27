@@ -104,6 +104,8 @@ def _coerce_retryable(error: Exception) -> bool:
     if isinstance(error, (GrixConnectionClosedError, GrixDependencyError)):
         return True
     lowered = str(error).lower()
+    if not lowered:
+        return True
     return any(
         token in lowered
         for token in (
