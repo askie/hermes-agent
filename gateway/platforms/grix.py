@@ -58,6 +58,7 @@ from gateway.platforms.grix_transport import (
     GrixAuthRejectedError,
     GrixConnectionClosedError,
     GrixDependencyError,
+    GrixPacketError,
     GrixTransportClient,
     GrixTransportError,
 )
@@ -106,6 +107,8 @@ def _coerce_retryable(error: Exception) -> bool:
     lowered = str(error).lower()
     if not lowered:
         return True
+    if isinstance(error, GrixPacketError) and error.code == 4008:
+        return True
     return any(
         token in lowered
         for token in (
@@ -119,6 +122,9 @@ def _coerce_retryable(error: Exception) -> bool:
             "not authenticated",
             "broken pipe",
             "reset by peer",
+            "too fast",
+            "rate limit",
+            "throttl",
         )
     )
 
@@ -273,6 +279,8 @@ class GrixAdapter(BasePlatformAdapter):
     platform = Platform.GRIX
     MAX_MESSAGE_LENGTH = 1800
 
+    _SEND_MIN_INTERVAL = 0.5  # minimum seconds between sends
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.GRIX)
         self.connection = build_grix_connection_config(config)
@@ -291,6 +299,8 @@ class GrixAdapter(BasePlatformAdapter):
         self._approval_state: Dict[str, Dict[str, Optional[str]]] = {}
         self._processing_message_ids: Dict[str, str] = {}
         self._revoked_message_keys: set[tuple[str, str]] = set()
+        self._last_send_at: float = 0.0
+        self._send_lock = asyncio.Lock()
 
     def format_message(self, content: str) -> str:
         return content
@@ -298,6 +308,23 @@ class GrixAdapter(BasePlatformAdapter):
     @staticmethod
     def _message_size(content: str) -> int:
         return len(content.encode("utf-8"))
+
+    async def _enforce_send_rate(self) -> None:
+        async with self._send_lock:
+            now = time.monotonic()
+            wait = self._SEND_MIN_INTERVAL - (now - self._last_send_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_send_at = time.monotonic()
+
+    async def _detect_dead_transport(self) -> None:
+        if not self.is_connected or not self._client:
+            return
+        status = self._client.status
+        if not status.get("connected"):
+            logger.warning("[%s] Transport is dead but adapter still connected, triggering reconnect", self.name)
+            self._set_fatal_error("grix_transport_dead", "transport disconnected without notification", retryable=True)
+            await self._notify_fatal_error()
 
     def _schedule_session_route_bind(self, *, session_key: str, session_id: str) -> None:
         client = self._client
@@ -402,7 +429,10 @@ class GrixAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         if not self._client:
+            await self._detect_dead_transport()
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
+
+        await self._enforce_send_rate()
 
         source_hint = self._latest_sources.get(str(chat_id))
         session_id, thread_id = await resolve_grix_target(
