@@ -318,13 +318,49 @@ class GrixAdapter(BasePlatformAdapter):
             self._last_send_at = time.monotonic()
 
     async def _detect_dead_transport(self) -> None:
-        if not self.is_connected or not self._client:
+        client = self._client
+        if not self.is_connected or not client:
             return
-        status = self._client.status
+        status = getattr(client, "status", None)
+        if not isinstance(status, dict):
+            return
         if not status.get("connected"):
             logger.warning("[%s] Transport is dead but adapter still connected, triggering reconnect", self.name)
             self._set_fatal_error("grix_transport_dead", "transport disconnected without notification", retryable=True)
             await self._notify_fatal_error()
+
+    async def _get_ready_client(
+        self,
+        *,
+        operation: str,
+        require_authed: bool = True,
+    ) -> Optional[GrixTransportClient]:
+        client = self._client
+        if not client:
+            return None
+
+        status = getattr(client, "status", None)
+        if not isinstance(status, dict):
+            return client
+
+        connected = bool(status.get("connected"))
+        authed = bool(status.get("authed"))
+        if connected and (authed or not require_authed):
+            return client
+
+        if self.is_connected and not self._disconnect_requested:
+            reason = str(status.get("last_error") or f"{operation}: transport is not connected")
+            logger.warning(
+                "[%s] GRIX transport unavailable during %s (connected=%s authed=%s): %s",
+                self.name,
+                operation,
+                connected,
+                authed,
+                reason,
+            )
+            self._set_fatal_error("grix_transport_dead", reason, retryable=True)
+            await self._notify_fatal_error()
+        return None
 
     def _schedule_session_route_bind(self, *, session_key: str, session_id: str) -> None:
         client = self._client
@@ -428,15 +464,15 @@ class GrixAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if not self._client:
-            await self._detect_dead_transport()
+        client = await self._get_ready_client(operation="send")
+        if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
 
         await self._enforce_send_rate()
 
         source_hint = self._latest_sources.get(str(chat_id))
         session_id, thread_id = await resolve_grix_target(
-            self._client,
+            client,
             self.connection,
             str(chat_id),
             thread_id=self._metadata_thread_id(metadata),
@@ -461,7 +497,7 @@ class GrixAdapter(BasePlatformAdapter):
             receipt = None
             for index, chunk in enumerate(chunks):
                 is_first = index == 0
-                receipt = await self._client.send_text(
+                receipt = await client.send_text(
                     str(session_id),
                     chunk,
                     reply_to_message_id=reply_to if is_first else None,
@@ -503,7 +539,8 @@ class GrixAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         approval_id: Optional[str] = None,
     ) -> SendResult:
-        if not self._client:
+        client = await self._get_ready_client(operation="send_exec_approval")
+        if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
 
         resolved_approval_id = str(approval_id or "").strip()
@@ -512,7 +549,7 @@ class GrixAdapter(BasePlatformAdapter):
 
         source_hint = self._latest_sources.get(str(chat_id))
         session_id, thread_id = await resolve_grix_target(
-            self._client,
+            client,
             self.connection,
             str(chat_id),
             thread_id=self._metadata_thread_id(metadata),
@@ -532,7 +569,7 @@ class GrixAdapter(BasePlatformAdapter):
         )
 
         try:
-            receipt = await self._client.send_text(
+            receipt = await client.send_text(
                 str(session_id),
                 message.content,
                 thread_id=thread_id,
@@ -569,17 +606,18 @@ class GrixAdapter(BasePlatformAdapter):
         # Grix follows the current edit_msg contract; finalize is accepted so
         # stream_consumer can call this adapter with a uniform signature.
         _ = finalize
-        if not self._client:
+        client = await self._get_ready_client(operation="edit_message")
+        if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
         try:
             source_hint = self._latest_sources.get(str(chat_id))
             session_id, _thread_id = await resolve_grix_target(
-                self._client,
+                client,
                 self.connection,
                 str(chat_id),
                 source_hint=source_hint,
             )
-            receipt = await self._client.edit_message(
+            receipt = await client.edit_message(
                 str(session_id),
                 str(message_id),
                 self.format_message(content),
@@ -599,11 +637,20 @@ class GrixAdapter(BasePlatformAdapter):
             )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        if not self._client:
+        client = await self._get_ready_client(operation="send_typing")
+        if not client:
             return
         try:
-            await self._client.set_session_activity(
-                session_id=str(chat_id),
+            source_hint = self._latest_sources.get(str(chat_id))
+            session_id, _thread_id = await resolve_grix_target(
+                client,
+                self.connection,
+                str(chat_id),
+                thread_id=self._metadata_thread_id(metadata),
+                source_hint=source_hint,
+            )
+            await client.set_session_activity(
+                session_id=str(session_id),
                 kind="composing",
                 active=True,
                 ttl_ms=self._metadata_ttl_ms(metadata),

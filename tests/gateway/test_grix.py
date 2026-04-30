@@ -110,6 +110,14 @@ class FakeProtocolClient:
         self.edits = []
         self.activities = []
         self.resolved_session_id = "g_resolved"
+        self._status = {"connected": True, "authed": True, "last_error": None}
+
+    @property
+    def status(self):
+        return dict(self._status)
+
+    def set_status(self, **kwargs):
+        self._status.update(kwargs)
 
     async def bind_session_route(self, **kwargs):
         self.bound_routes.append(kwargs)
@@ -1271,6 +1279,93 @@ class TestGrixAdapter:
                 }
             }
         }
+
+    @pytest.mark.asyncio
+    async def test_send_marks_transport_dead_when_client_status_disconnected(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        fake_client.set_status(connected=False, authed=False, last_error="server closed")
+        adapter._client = fake_client
+        adapter._mark_connected()
+
+        calls = []
+
+        async def _fatal(_adapter):
+            calls.append((_adapter.fatal_error_code, _adapter.fatal_error_message))
+
+        adapter.set_fatal_error_handler(_fatal)
+        result = await adapter.send(chat_id="g_1001", content="hello")
+
+        assert result.success is False
+        assert result.retryable is True
+        assert result.error == "GRIX transport is not connected"
+        assert adapter.fatal_error_code == "grix_transport_dead"
+        assert adapter.fatal_error_message == "server closed"
+        assert calls == [("grix_transport_dead", "server closed")]
+        assert fake_client.sent == []
+
+    @pytest.mark.asyncio
+    async def test_edit_message_marks_transport_dead_when_client_status_disconnected(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        fake_client.set_status(connected=False, authed=False, last_error="heartbeat failed")
+        adapter._client = fake_client
+        adapter._mark_connected()
+
+        calls = []
+
+        async def _fatal(_adapter):
+            calls.append((_adapter.fatal_error_code, _adapter.fatal_error_message))
+
+        adapter.set_fatal_error_handler(_fatal)
+        result = await adapter.edit_message(chat_id="g_1001", message_id="out-1", content="updated")
+
+        assert result.success is False
+        assert result.retryable is True
+        assert result.error == "GRIX transport is not connected"
+        assert adapter.fatal_error_code == "grix_transport_dead"
+        assert adapter.fatal_error_message == "heartbeat failed"
+        assert calls == [("grix_transport_dead", "heartbeat failed")]
+        assert fake_client.edits == []
+
+    @pytest.mark.asyncio
+    async def test_send_typing_marks_transport_dead_when_client_status_disconnected(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        fake_client.set_status(connected=False, authed=False, last_error="ping timeout")
+        adapter._client = fake_client
+        adapter._mark_connected()
+
+        calls = []
+
+        async def _fatal(_adapter):
+            calls.append((_adapter.fatal_error_code, _adapter.fatal_error_message))
+
+        adapter.set_fatal_error_handler(_fatal)
+        await adapter.send_typing(chat_id="g_1001")
+
+        assert adapter.fatal_error_code == "grix_transport_dead"
+        assert adapter.fatal_error_message == "ping timeout"
+        assert calls == [("grix_transport_dead", "ping timeout")]
+        assert fake_client.activities == []
 
     @pytest.mark.asyncio
     async def test_local_action_approve_resolves_specific_approval(self):
