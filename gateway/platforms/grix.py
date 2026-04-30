@@ -303,7 +303,7 @@ class GrixAdapter(BasePlatformAdapter):
         self._send_lock = asyncio.Lock()
 
     def format_message(self, content: str) -> str:
-        return content
+        return content.strip()
 
     @staticmethod
     def _message_size(content: str) -> int:
