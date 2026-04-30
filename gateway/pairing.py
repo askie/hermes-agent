@@ -27,7 +27,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_hermes_dir
+from utils import atomic_replace
 
 
 # Unambiguous alphabet -- excludes 0/O, 1/I to prevent confusion
@@ -71,7 +72,7 @@ def _secure_write(path: Path, data: str) -> None:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, str(path))
+        atomic_replace(tmp_path, path)
         try:
             os.chmod(path, 0o600)
         except OSError:
