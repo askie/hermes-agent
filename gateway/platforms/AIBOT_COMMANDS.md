@@ -69,6 +69,8 @@
 | `local_action_result` | Client -> Server | 本地动作执行结果 |
 | `session_route_bind` | Client -> Server | 绑定会话路由 |
 | `session_route_resolve` | Client -> Server | 查询会话路由 |
+| `agent_invoke` | Client -> Server | 调用后端 API 动作 |
+| `agent_invoke_result` | Server -> Client | 后端 API 动作结果 |
 | `error` | 双向 | 通用错误响应 |
 
 ## 4. 连接与认证
@@ -95,11 +97,13 @@
       "session_route",
       "thread_v1",
       "inbound_media_v1",
-      "local_action_v1"
+      "local_action_v1",
+      "agent_invoke_v1"
     ],
     "local_actions": [
       "exec_approve",
-      "exec_reject"
+      "exec_reject",
+      "file_list"
     ]
   }
 }
@@ -641,6 +645,7 @@
 - `thread_v1`
 - `inbound_media_v1`
 - `local_action_v1`
+- `agent_invoke_v1`
 
 当前认证阶段要求至少声明：
 

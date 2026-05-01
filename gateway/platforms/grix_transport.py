@@ -7,10 +7,13 @@ from contextlib import suppress
 import hashlib
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional, Protocol
 
 from gateway.platforms.aibot_contract import (
+    CMD_AGENT_INVOKE,
+    CMD_AGENT_INVOKE_RESULT,
     CMD_AUTH,
     CMD_AUTH_ACK,
     CMD_EDIT_MSG,
@@ -603,6 +606,33 @@ class GrixTransportClient:
             "route_session_key": str(packet["payload"].get("route_session_key") or "").strip(),
             "session_id": session_id,
         }
+
+    async def agent_invoke(
+        self,
+        *,
+        action: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "invoke_id": uuid.uuid4().hex,
+            "action": action.strip(),
+            "timeout_ms": timeout_ms or 15_000,
+        }
+        if params:
+            payload["params"] = params
+
+        packet = await self.request(
+            CMD_AGENT_INVOKE,
+            payload,
+            expected=(CMD_AGENT_INVOKE_RESULT, CMD_ERROR),
+            timeout_ms=timeout_ms or 30_000,
+        )
+        result_payload = packet["payload"]
+        code = parse_code(result_payload)
+        if code != 0:
+            raise GrixPacketError(packet["cmd"], code, parse_message(result_payload))
+        return result_payload
 
     async def _reader_loop(self) -> None:
         try:

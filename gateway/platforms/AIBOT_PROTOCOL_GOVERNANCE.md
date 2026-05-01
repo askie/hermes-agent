@@ -129,6 +129,8 @@
 - `local_action_result`
 - `session_route_bind`
 - `session_route_resolve`
+- `agent_invoke`
+- `agent_invoke_result`
 
 插件侧不应该依赖：
 

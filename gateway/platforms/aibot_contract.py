@@ -36,6 +36,8 @@ CMD_EVENT_EDIT = "event_edit"
 CMD_EVENT_REVOKE = "event_revoke"
 CMD_SESSION_ROUTE_BIND = "session_route_bind"
 CMD_SESSION_ROUTE_RESOLVE = "session_route_resolve"
+CMD_AGENT_INVOKE = "agent_invoke"
+CMD_AGENT_INVOKE_RESULT = "agent_invoke_result"
 
 STABLE_PUBLIC_COMMANDS = (
     {"cmd": CMD_AUTH, "direction": "client_to_server", "purpose": "authenticate"},
@@ -75,6 +77,8 @@ STABLE_PUBLIC_COMMANDS = (
         "direction": "client_to_server",
         "purpose": "resolve_session_route",
     },
+    {"cmd": CMD_AGENT_INVOKE, "direction": "client_to_server", "purpose": "invoke_backend_action"},
+    {"cmd": CMD_AGENT_INVOKE_RESULT, "direction": "server_to_client", "purpose": "invoke_backend_action_result"},
     {"cmd": CMD_ERROR, "direction": "bidirectional", "purpose": "generic_error"},
 )
 
@@ -83,6 +87,7 @@ CAP_SESSION_ROUTE = "session_route"
 CAP_THREAD_V1 = "thread_v1"
 CAP_INBOUND_MEDIA_V1 = "inbound_media_v1"
 CAP_LOCAL_ACTION_V1 = "local_action_v1"
+CAP_AGENT_INVOKE_V1 = "agent_invoke_v1"
 
 REQUIRED_AUTH_CAPABILITIES = (CAP_LOCAL_ACTION_V1,)
 STABLE_AUTH_CAPABILITIES = (
@@ -90,6 +95,7 @@ STABLE_AUTH_CAPABILITIES = (
     CAP_THREAD_V1,
     CAP_INBOUND_MEDIA_V1,
     CAP_LOCAL_ACTION_V1,
+    CAP_AGENT_INVOKE_V1,
 )
 
 # Local actions
@@ -189,6 +195,8 @@ MINIMAL_PLUGIN_SURFACE = (
     CMD_LOCAL_ACTION_RESULT,
     CMD_SESSION_ROUTE_BIND,
     CMD_SESSION_ROUTE_RESOLVE,
+    CMD_AGENT_INVOKE,
+    CMD_AGENT_INVOKE_RESULT,
 )
 
 

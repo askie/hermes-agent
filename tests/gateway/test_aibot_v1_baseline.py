@@ -104,10 +104,12 @@ class TestAibotV1Baseline:
                 "thread_v1",
                 "inbound_media_v1",
                 "local_action_v1",
+                "agent_invoke_v1",
             ],
             "local_actions": [
                 "exec_approve",
                 "exec_reject",
+                "file_list",
             ],
         }
 
