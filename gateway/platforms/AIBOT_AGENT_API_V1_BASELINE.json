@@ -88,6 +88,11 @@
       "purpose": "edit_message"
     },
     {
+      "cmd": "delete_msg",
+      "direction": "client_to_server",
+      "purpose": "delete_message"
+    },
+    {
       "cmd": "session_activity_set",
       "direction": "client_to_server",
       "purpose": "session_activity_update"
@@ -216,6 +221,7 @@
     "send_ack",
     "send_nack",
     "edit_msg",
+    "delete_msg",
     "local_action",
     "local_action_result",
     "session_route_bind",

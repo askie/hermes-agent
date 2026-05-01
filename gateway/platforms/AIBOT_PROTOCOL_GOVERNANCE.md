@@ -125,6 +125,7 @@
 - `send_ack`
 - `send_nack`
 - `edit_msg`
+- `delete_msg`
 - `local_action`
 - `local_action_result`
 - `session_route_bind`

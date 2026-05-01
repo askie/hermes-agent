@@ -64,6 +64,7 @@
 | `send_ack` | Server -> Client | 发送成功 |
 | `send_nack` | Server -> Client | 发送失败 |
 | `edit_msg` | Client -> Server | 编辑已发送消息 |
+| `delete_msg` | Client -> Server | 删除已发送消息 |
 | `session_activity_set` | Client -> Server | 设置会话活动状态 |
 | `local_action` | Server -> Client | 本地动作请求 |
 | `local_action_result` | Client -> Server | 本地动作执行结果 |

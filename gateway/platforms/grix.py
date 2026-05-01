@@ -636,6 +636,40 @@ class GrixAdapter(BasePlatformAdapter):
                 retryable=_coerce_retryable(exc),
             )
 
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> SendResult:
+        client = await self._get_ready_client(operation="delete_message")
+        if not client:
+            return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
+        try:
+            source_hint = self._latest_sources.get(str(chat_id))
+            session_id, _thread_id = await resolve_grix_target(
+                client,
+                self.connection,
+                str(chat_id),
+                source_hint=source_hint,
+            )
+            receipt = await client.delete_message(
+                str(session_id),
+                str(message_id),
+            )
+            return SendResult(
+                success=bool(receipt.get("ok")),
+                message_id=receipt.get("message_id"),
+                raw_response=receipt,
+                retryable=False,
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+                raw_response=exc,
+                retryable=_coerce_retryable(exc),
+            )
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         client = await self._get_ready_client(operation="send_typing")
         if not client:

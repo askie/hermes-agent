@@ -62,6 +62,7 @@ _HERMES_CORE_TOOLS = [
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Grix backend APIs (gated on Grix adapter + agent_invoke capability via check_fn)
     "grix_invoke",
+    "grix_unsend",
 ]
 
 
@@ -333,8 +334,8 @@ TOOLSETS = {
     },
 
     "grix": {
-        "description": "Grix backend APIs - contacts, messages, groups, and admin via agent_invoke",
-        "tools": ["grix_invoke"],
+        "description": "Grix backend APIs - contacts, messages, groups, admin, and unsend",
+        "tools": ["grix_invoke", "grix_unsend"],
         "includes": []
     },
 

@@ -23,6 +23,7 @@ CMD_SEND_ACK = "send_ack"
 CMD_SEND_NACK = "send_nack"
 CMD_ERROR = "error"
 CMD_EDIT_MSG = "edit_msg"
+CMD_DELETE_MSG = "delete_msg"
 CMD_SESSION_ACTIVITY_SET = "session_activity_set"
 CMD_LOCAL_ACTION = "local_action"
 CMD_LOCAL_ACTION_RESULT = "local_action_result"
@@ -56,6 +57,7 @@ STABLE_PUBLIC_COMMANDS = (
     {"cmd": CMD_SEND_ACK, "direction": "server_to_client", "purpose": "send_succeeded"},
     {"cmd": CMD_SEND_NACK, "direction": "server_to_client", "purpose": "send_failed"},
     {"cmd": CMD_EDIT_MSG, "direction": "client_to_server", "purpose": "edit_message"},
+    {"cmd": CMD_DELETE_MSG, "direction": "client_to_server", "purpose": "delete_message"},
     {
         "cmd": CMD_SESSION_ACTIVITY_SET,
         "direction": "client_to_server",
@@ -191,6 +193,7 @@ MINIMAL_PLUGIN_SURFACE = (
     CMD_SEND_ACK,
     CMD_SEND_NACK,
     CMD_EDIT_MSG,
+    CMD_DELETE_MSG,
     CMD_LOCAL_ACTION,
     CMD_LOCAL_ACTION_RESULT,
     CMD_SESSION_ROUTE_BIND,

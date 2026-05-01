@@ -16,6 +16,7 @@ from gateway.platforms.aibot_contract import (
     CMD_AGENT_INVOKE_RESULT,
     CMD_AUTH,
     CMD_AUTH_ACK,
+    CMD_DELETE_MSG,
     CMD_EDIT_MSG,
     CMD_ERROR,
     CMD_EVENT_ACK,
@@ -418,6 +419,31 @@ class GrixTransportClient:
                 "session_id": session_id.strip(),
                 "msg_id": message_id.strip(),
                 "content": text,
+            },
+            expected=(CMD_SEND_ACK, CMD_SEND_NACK, CMD_ERROR),
+            timeout_ms=timeout_ms,
+        )
+        if packet["cmd"] != CMD_SEND_ACK:
+            raise self._packet_error(packet)
+        return {
+            "ok": True,
+            "session_id": str(packet["payload"].get("session_id") or session_id).strip(),
+            "message_id": str(packet["payload"].get("msg_id") or message_id).strip(),
+            "packet": packet,
+        }
+
+    async def delete_message(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        timeout_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        packet = await self.request(
+            CMD_DELETE_MSG,
+            {
+                "session_id": session_id.strip(),
+                "msg_id": message_id.strip(),
             },
             expected=(CMD_SEND_ACK, CMD_SEND_NACK, CMD_ERROR),
             timeout_ms=timeout_ms,
