@@ -113,6 +113,16 @@
       "purpose": "resolve_session_route"
     },
     {
+      "cmd": "agent_invoke",
+      "direction": "client_to_server",
+      "purpose": "invoke_backend_action"
+    },
+    {
+      "cmd": "agent_invoke_result",
+      "direction": "server_to_client",
+      "purpose": "invoke_backend_action_result"
+    },
+    {
       "cmd": "error",
       "direction": "bidirectional",
       "purpose": "generic_error"
@@ -132,12 +142,14 @@
       "session_route",
       "thread_v1",
       "inbound_media_v1",
-      "local_action_v1"
+      "local_action_v1",
+      "agent_invoke_v1"
     ]
   },
   "local_actions": [
     "exec_approve",
-    "exec_reject"
+    "exec_reject",
+    "file_list"
   ],
   "statuses": {
     "event_result": [
@@ -207,6 +219,8 @@
     "local_action",
     "local_action_result",
     "session_route_bind",
-    "session_route_resolve"
+    "session_route_resolve",
+    "agent_invoke",
+    "agent_invoke_result"
   ]
 }

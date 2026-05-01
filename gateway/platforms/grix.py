@@ -660,6 +660,18 @@ class GrixAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] GRIX typing update failed: %s", self.name, exc)
 
+    async def agent_invoke(
+        self,
+        *,
+        action: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        client = await self._get_ready_client(operation="agent_invoke")
+        if not client:
+            raise RuntimeError("GRIX transport is not connected")
+        return await client.agent_invoke(action=action, params=params, timeout_ms=timeout_ms)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         source = self._latest_sources.get(str(chat_id))
         if source:
