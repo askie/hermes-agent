@@ -6,7 +6,8 @@ from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_ACTIONS = {
+# Actions routed through agent_invoke (backend API proxy)
+_INVOKE_ACTIONS = {
     "contact_search": "Search contacts by keyword or ID",
     "session_search": "Search sessions by keyword",
     "message_history": "Get message history for a session",
@@ -29,12 +30,21 @@ SUPPORTED_ACTIONS = {
     "agent_api_key_rotate": "Rotate an agent's API key",
 }
 
+# Actions routed directly to WS protocol commands (no backend proxy)
+_PROTOCOL_ACTIONS = {
+    "send_message": "Send a text message to a session",
+    "delete_message": "Delete (unsend/recall) a message",
+}
+
+SUPPORTED_ACTIONS = {**_INVOKE_ACTIONS, **_PROTOCOL_ACTIONS}
+
 GRIX_INVOKE_SCHEMA = {
     "name": "grix_invoke",
     "description": (
-        "Call Grix backend APIs to manage contacts, messages, groups, and agent administration. "
-        "Communicates through the existing Grix WebSocket connection.\n\n"
+        "Unified Grix API — send messages, delete messages, query contacts/sessions/messages, "
+        "manage groups, and administer agents. All through the existing Grix WebSocket connection.\n\n"
         "Supported actions:\n"
+        "  Message: send_message, delete_message\n"
         "  Query: contact_search, session_search, message_history, message_search\n"
         "  Group: group_create, group_detail_read, group_leave_self, group_member_add, "
         "group_member_remove, group_member_role_update, group_all_members_muted_update, "
@@ -69,14 +79,11 @@ def _check_grix_invoke() -> bool:
     try:
         from gateway.run import _gateway_runner_ref
         from gateway.config import Platform
-        from gateway.platforms.aibot_contract import CAP_AGENT_INVOKE_V1
         runner = _gateway_runner_ref()
         if not runner:
             return False
         adapter = runner.adapters.get(Platform.GRIX)
-        if not adapter:
-            return False
-        return CAP_AGENT_INVOKE_V1 in (adapter.connection.capabilities or [])
+        return adapter is not None
     except Exception:
         return False
 
@@ -113,6 +120,13 @@ async def _grix_invoke_handler(args: dict, **kwargs) -> str:
         if not adapter:
             return tool_error("Grix adapter is not connected")
 
+        # Route protocol-level actions directly (no backend proxy)
+        if action == "send_message":
+            return await _handle_send_message(adapter, params)
+        if action == "delete_message":
+            return await _handle_delete_message(adapter, params)
+
+        # Default: proxy through agent_invoke
         result = await adapter.agent_invoke(
             action=action,
             params=params,
@@ -121,7 +135,56 @@ async def _grix_invoke_handler(args: dict, **kwargs) -> str:
         return tool_result(result)
     except Exception as exc:
         logger.warning("grix_invoke '%s' failed: %s", action, exc)
-        return tool_error(f"agent_invoke failed: {exc}")
+        return tool_error(f"grix_invoke failed: {exc}")
+
+
+async def _handle_send_message(adapter, params: dict) -> str:
+    from tools.registry import tool_error, tool_result
+
+    if not params:
+        return tool_error("send_message requires params with 'session_id' and 'content'")
+
+    session_id = str(params.get("session_id") or "").strip()
+    content = str(params.get("content") or params.get("message") or "").strip()
+    if not session_id:
+        return tool_error("send_message requires 'session_id'")
+    if not content:
+        return tool_error("send_message requires 'content'")
+
+    quoted_message_id = str(params.get("quoted_message_id") or "").strip() or None
+    msg_type = params.get("msg_type")
+
+    result = await adapter.send_message(
+        chat_id=session_id,
+        content=content,
+        quoted_message_id=quoted_message_id,
+        msg_type=msg_type,
+    )
+    if result.success:
+        return tool_result({"ok": True, "message_id": result.message_id})
+    return tool_error(result.error or "send_message failed")
+
+
+async def _handle_delete_message(adapter, params: dict) -> str:
+    from tools.registry import tool_error, tool_result
+
+    if not params:
+        return tool_error("delete_message requires params with 'message_id' and 'session_id'")
+
+    message_id = str(params.get("message_id") or "").strip()
+    session_id = str(params.get("session_id") or "").strip()
+    if not message_id:
+        return tool_error("delete_message requires 'message_id'")
+    if not session_id:
+        return tool_error("delete_message requires 'session_id'")
+
+    result = await adapter.delete_message(
+        chat_id=session_id,
+        message_id=message_id,
+    )
+    if result.success:
+        return tool_result({"ok": True, "message_id": result.message_id})
+    return tool_error(result.error or "delete_message failed")
 
 
 from tools.registry import registry
@@ -133,6 +196,6 @@ registry.register(
     handler=_grix_invoke_handler,
     check_fn=_check_grix_invoke,
     is_async=True,
-    description="Call Grix backend APIs (contacts, messages, groups, admin) via agent_invoke.",
+    description="Unified Grix API: send/delete messages, query contacts, manage groups, admin agents.",
     emoji="🔗",
 )

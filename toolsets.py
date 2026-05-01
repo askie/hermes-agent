@@ -60,9 +60,8 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-    # Grix backend APIs (gated on Grix adapter + agent_invoke capability via check_fn)
+    # Grix backend APIs (gated on Grix adapter via check_fn)
     "grix_invoke",
-    "grix_unsend",
 ]
 
 
@@ -334,8 +333,8 @@ TOOLSETS = {
     },
 
     "grix": {
-        "description": "Grix backend APIs - contacts, messages, groups, admin, and unsend",
-        "tools": ["grix_invoke", "grix_unsend"],
+        "description": "Grix backend APIs - messaging, contacts, groups, admin",
+        "tools": ["grix_invoke"],
         "includes": []
     },
 
