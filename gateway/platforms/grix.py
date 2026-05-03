@@ -296,6 +296,8 @@ class GrixAdapter(BasePlatformAdapter):
         self._latest_sources: Dict[str, Any] = {}
         self._message_sources: Dict[tuple[str, str], Any] = {}
         self._message_session_keys: Dict[tuple[str, str], str] = {}
+        self._user_dm_session_ids: Dict[str, str] = {}
+        self._user_dm_session_keys: Dict[str, str] = {}
         self._approval_state: Dict[str, Dict[str, Optional[str]]] = {}
         self._processing_message_ids: Dict[str, str] = {}
         self._revoked_message_keys: set[tuple[str, str]] = set()
@@ -519,12 +521,18 @@ class GrixAdapter(BasePlatformAdapter):
             )
             # Track busy-ack notifications so they can be auto-deleted later.
             # When run.py sends a busy-ack, the user's message is already in
-            # _pending_messages and reply_to points to it. Use this state-based
-            # check instead of fragile content matching.
+            # _pending_messages and reply_to points to it. Scan pending messages
+            # to find the matching session_key.
             if result.message_id and reply_to:
-                _sk = self._message_session_keys.get((str(session_id), str(reply_to)))
-                if _sk and _sk in self._pending_messages:
-                    self._busy_ack_msg_ids[_sk] = (str(chat_id), result.message_id)
+                _normalized_reply_to = str(reply_to).strip()
+                for _sk, _pe in self._pending_messages.items():
+                    if _pe and str(getattr(_pe, "message_id", "")).strip() == _normalized_reply_to:
+                        self._busy_ack_msg_ids[_sk] = (str(chat_id), result.message_id)
+                        logger.debug(
+                            "[%s] Tracked busy-ack notification msg_id=%s for session_key=%s",
+                            self.name, result.message_id, _sk,
+                        )
+                        break
             return result
         except Exception as exc:
             if event_id:
@@ -744,23 +752,35 @@ class GrixAdapter(BasePlatformAdapter):
             ack_entry = self._busy_ack_msg_ids.pop(session_key, None)
             if ack_entry:
                 chat_id, msg_id = ack_entry
+                logger.debug(
+                    "[%s] Scheduling busy-ack deletion msg_id=%s for session_key=%s",
+                    self.name, msg_id, session_key,
+                )
                 try:
                     loop = asyncio.get_running_loop()
                     loop.create_task(self._delete_busy_ack(chat_id, msg_id, session_key))
                 except RuntimeError:
-                    pass
+                    logger.warning(
+                        "[%s] No running loop for busy-ack deletion msg_id=%s",
+                        self.name, msg_id,
+                    )
+            else:
+                logger.debug(
+                    "[%s] No busy-ack to delete for session_key=%s",
+                    self.name, session_key,
+                )
         return event
 
     async def _delete_busy_ack(self, chat_id: str, msg_id: str, session_key: str) -> None:
         """Best-effort deletion of a busy-ack notification."""
         try:
-            await self.delete_message(chat_id, msg_id)
+            result = await self.delete_message(chat_id, msg_id)
             logger.debug(
-                "[%s] Deleted busy-ack notification %s for session %s",
-                self.name, msg_id, session_key,
+                "[%s] Deleted busy-ack notification %s for session %s (success=%s)",
+                self.name, msg_id, session_key, result.success,
             )
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "[%s] Failed to delete busy-ack notification %s: %s",
                 self.name, msg_id, exc,
             )
@@ -1045,6 +1065,8 @@ class GrixAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+        prev_session_key = self._user_dm_session_keys.get(str(message.sender_id or "")) if message.chat_type == "dm" and message.sender_id else None
+        prev_session_id = self._user_dm_session_ids.get(str(message.sender_id or "")) if message.chat_type == "dm" and message.sender_id else None
         self._latest_sources[message.session_id] = source
         self._latest_sources[session_key] = source
         if message.thread_id:
@@ -1052,6 +1074,35 @@ class GrixAdapter(BasePlatformAdapter):
         self._reply_event_ids[(message.session_id, message.message_id)] = message.event_id
         self._message_sources[(message.session_id, message.message_id)] = source
         self._message_session_keys[(message.session_id, message.message_id)] = session_key
+
+        if message.chat_type == "dm" and message.sender_id:
+            sender_key = str(message.sender_id)
+            self._user_dm_session_ids[sender_key] = str(message.session_id)
+            self._user_dm_session_keys[sender_key] = session_key
+            if prev_session_id and prev_session_id != str(message.session_id):
+                logger.warning(
+                    "[%s] GRIX DM session_id changed for user=%s old_session_id=%s new_session_id=%s old_session_key=%s new_session_key=%s event_id=%s message_id=%s",
+                    self.name,
+                    sender_key,
+                    prev_session_id,
+                    message.session_id,
+                    prev_session_key,
+                    session_key,
+                    message.event_id,
+                    message.message_id,
+                )
+
+        logger.debug(
+            "[%s] GRIX inbound route event_id=%s message_id=%s sender_id=%s session_id=%s chat_type=%s thread_id=%s session_key=%s duplicate_check_pending=true",
+            self.name,
+            message.event_id,
+            message.message_id,
+            message.sender_id,
+            message.session_id,
+            message.chat_type,
+            message.thread_id,
+            session_key,
+        )
 
         is_duplicate = self._remember_event_id(message.event_id)
         if is_duplicate:

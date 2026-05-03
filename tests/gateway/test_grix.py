@@ -108,6 +108,7 @@ class FakeProtocolClient:
         self.local_action_results = []
         self.sent = []
         self.edits = []
+        self.deleted = []
         self.activities = []
         self.resolved_session_id = "g_resolved"
         self._status = {"connected": True, "authed": True, "last_error": None}
@@ -156,6 +157,10 @@ class FakeProtocolClient:
     async def edit_message(self, session_id: str, message_id: str, text: str, **kwargs):
         self.edits.append({"session_id": session_id, "message_id": message_id, "text": text, **kwargs})
         return {"ok": True, "session_id": session_id, "message_id": message_id}
+
+    async def delete_message(self, session_id: str, message_id: str):
+        self.deleted.append({"session_id": session_id, "message_id": message_id})
+        return {"ok": True, "message_id": message_id}
 
     async def set_session_activity(self, **kwargs):
         self.activities.append(kwargs)
@@ -1740,3 +1745,171 @@ class TestGrixAdapter:
         assert session_store.transcript[-2]["grix_message_id"] == "66"
         assert fake_client.acknowledged_events[0]["event_id"] == "evt-revoke-old"
         assert fake_client.completed_events == []
+
+    @pytest.mark.asyncio
+    async def test_send_tracks_busy_ack_by_pending_message_id(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+
+        source = adapter.build_source(
+            chat_id="g_1001",
+            chat_type="group",
+            user_id="u_8",
+            user_name="alice",
+            thread_id="topic-a",
+        )
+        session_key = build_session_key(source)
+        adapter._pending_messages[session_key] = MessageEvent(
+            text="hello",
+            source=source,
+            message_id="55",
+        )
+
+        result = await adapter.send(chat_id="g_1001", content="busy", reply_to="55")
+
+        assert result.success is True
+        assert adapter._busy_ack_msg_ids == {session_key: ("g_1001", "out-1")}
+
+    @pytest.mark.asyncio
+    async def test_get_pending_message_schedules_busy_ack_deletion(self, monkeypatch):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        source = adapter.build_source(
+            chat_id="g_1001",
+            chat_type="group",
+            user_id="u_8",
+            user_name="alice",
+            thread_id="topic-a",
+        )
+        session_key = build_session_key(source)
+        pending_event = MessageEvent(text="hello", source=source, message_id="55")
+        adapter._pending_messages[session_key] = pending_event
+        adapter._busy_ack_msg_ids[session_key] = ("g_1001", "busy-1")
+
+        scheduled = []
+
+        class DummyLoop:
+            def create_task(self, coro):
+                scheduled.append(coro)
+                coro.close()
+                return None
+
+        monkeypatch.setattr(asyncio, "get_running_loop", lambda: DummyLoop())
+
+        event = adapter.get_pending_message(session_key)
+
+        assert event is pending_event
+        assert session_key not in adapter._pending_messages
+        assert session_key not in adapter._busy_ack_msg_ids
+        assert len(scheduled) == 1
+
+    @pytest.mark.asyncio
+    async def test_event_revoke_deletes_busy_ack_for_pending_message(self):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+        source = adapter.build_source(
+            chat_id="g_1001",
+            chat_type="group",
+            user_id="u_8",
+            user_name="alice",
+            thread_id="topic-a",
+        )
+        session_key = build_session_key(source)
+        adapter._message_sources[("g_1001", "55")] = source
+        adapter._message_session_keys[("g_1001", "55")] = session_key
+        adapter._reply_event_ids[("g_1001", "55")] = "evt-1"
+        adapter._pending_messages[session_key] = MessageEvent(
+            text="old text",
+            source=source,
+            message_id="55",
+        )
+        adapter._busy_ack_msg_ids[session_key] = ("g_1001", "busy-1")
+
+        await adapter._handle_protocol_packet(
+            {
+                "cmd": "event_revoke",
+                "seq": 0,
+                "payload": {
+                    "event_id": "evt-revoke-busy",
+                    "session_id": "g_1001",
+                    "session_type": 2,
+                    "msg_id": "55",
+                    "sender_id": "u_8",
+                    "is_revoked": True,
+                },
+            }
+        )
+
+        assert session_key not in adapter._pending_messages
+        assert session_key not in adapter._busy_ack_msg_ids
+        assert fake_client.deleted == [{"session_id": "g_1001", "message_id": "busy-1"}]
+
+    @pytest.mark.asyncio
+    async def test_dm_session_change_updates_tracking_and_logs_warning(self, caplog):
+        adapter = GrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                api_key="secret",
+                extra={"endpoint": "wss://example.invalid/ws", "agent_id": "9001"},
+            )
+        )
+        fake_client = FakeProtocolClient()
+        adapter._client = fake_client
+        adapter.set_message_handler(lambda event: None)
+
+        with caplog.at_level("WARNING"):
+            await adapter._handle_protocol_packet(
+                {
+                    "cmd": "event_msg",
+                    "seq": 0,
+                    "payload": {
+                        "event_id": "evt-dm-1",
+                        "event_type": "private_message",
+                        "session_type": 1,
+                        "session_id": "dm_1",
+                        "msg_id": "55",
+                        "sender_id": "u_8",
+                        "sender_name": "alice",
+                        "content": {"text": "hello"},
+                    },
+                }
+            )
+            await adapter._handle_protocol_packet(
+                {
+                    "cmd": "event_msg",
+                    "seq": 0,
+                    "payload": {
+                        "event_id": "evt-dm-2",
+                        "event_type": "private_message",
+                        "session_type": 1,
+                        "session_id": "dm_2",
+                        "msg_id": "56",
+                        "sender_id": "u_8",
+                        "sender_name": "alice",
+                        "content": {"text": "hello again"},
+                    },
+                }
+            )
+
+        assert adapter._user_dm_session_ids["u_8"] == "dm_2"
+        assert adapter._user_dm_session_keys["u_8"] == "agent:main:grix:dm:dm_2"
+        assert "GRIX DM session_id changed for user=u_8" in caplog.text
