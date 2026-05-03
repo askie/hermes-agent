@@ -299,6 +299,7 @@ class GrixAdapter(BasePlatformAdapter):
         self._approval_state: Dict[str, Dict[str, Optional[str]]] = {}
         self._processing_message_ids: Dict[str, str] = {}
         self._revoked_message_keys: set[tuple[str, str]] = set()
+        self._busy_ack_msg_ids: Dict[str, tuple[str, str]] = {}  # session_key -> (chat_id, notification_msg_id)
         self._last_send_at: float = 0.0
         self._send_lock = asyncio.Lock()
 
@@ -510,12 +511,21 @@ class GrixAdapter(BasePlatformAdapter):
                     await asyncio.sleep(0.2)
             if event_id:
                 await self._complete_event_if_needed(event_id, status=STATUS_RESPONDED)
-            return SendResult(
+            result = SendResult(
                 success=bool(receipt and receipt.get("ok")),
                 message_id=receipt.get("message_id") if receipt else None,
                 raw_response=receipt,
                 retryable=False,
             )
+            # Track busy-ack notifications so they can be auto-deleted later.
+            # When run.py sends a busy-ack, the user's message is already in
+            # _pending_messages and reply_to points to it. Use this state-based
+            # check instead of fragile content matching.
+            if result.message_id and reply_to:
+                _sk = self._message_session_keys.get((str(session_id), str(reply_to)))
+                if _sk and _sk in self._pending_messages:
+                    self._busy_ack_msg_ids[_sk] = (str(chat_id), result.message_id)
+            return result
         except Exception as exc:
             if event_id:
                 await self._complete_event_if_needed(
@@ -726,6 +736,34 @@ class GrixAdapter(BasePlatformAdapter):
             }
 
         return {"id": str(chat_id), "name": str(chat_id), "type": "dm"}
+
+    def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
+        """Dequeue pending message and schedule busy-ack notification deletion."""
+        event = self._pending_messages.pop(session_key, None)
+        if event:
+            ack_entry = self._busy_ack_msg_ids.pop(session_key, None)
+            if ack_entry:
+                chat_id, msg_id = ack_entry
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._delete_busy_ack(chat_id, msg_id, session_key))
+                except RuntimeError:
+                    pass
+        return event
+
+    async def _delete_busy_ack(self, chat_id: str, msg_id: str, session_key: str) -> None:
+        """Best-effort deletion of a busy-ack notification."""
+        try:
+            await self.delete_message(chat_id, msg_id)
+            logger.debug(
+                "[%s] Deleted busy-ack notification %s for session %s",
+                self.name, msg_id, session_key,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[%s] Failed to delete busy-ack notification %s: %s",
+                self.name, msg_id, exc,
+            )
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
@@ -1230,6 +1268,11 @@ class GrixAdapter(BasePlatformAdapter):
         pending_event = self._pending_messages.get(session_key or "")
         if pending_event and pending_event.message_id == revoke.message_id:
             self._pending_messages.pop(session_key, None)
+            # Delete the busy-ack notification if one was sent
+            ack_entry = self._busy_ack_msg_ids.pop(session_key, None) if session_key else None
+            if ack_entry:
+                ack_chat_id, ack_msg_id = ack_entry
+                await self._delete_busy_ack(ack_chat_id or revoke.session_id, ack_msg_id, session_key or "")
             logger.debug(
                 "[%s] Dropped pending Hermes event from GRIX revoke for %s/%s",
                 self.name,
