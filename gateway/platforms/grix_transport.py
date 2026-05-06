@@ -162,7 +162,7 @@ async def default_connector(config: GrixConnectionConfig) -> GrixSocket:
         ws = await session.ws_connect(
             config.endpoint,
             receive_timeout=None,
-            heartbeat=None,
+            heartbeat=30,
             timeout=max(config.connect_timeout_ms / 1000, 1),
         )
     except Exception:
@@ -347,8 +347,7 @@ class GrixTransportClient:
 
         try:
             return await future
-        except TimeoutError as exc:
-            await self.disconnect(str(exc))
+        except TimeoutError:
             raise
 
     async def send_text(

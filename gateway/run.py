@@ -3126,6 +3126,9 @@ class GatewayRunner:
             )
         asyncio.create_task(self._platform_reconnect_watcher())
 
+        # Start background transport health watcher
+        asyncio.create_task(self._transport_health_watcher())
+
         logger.info("Press Ctrl+C to stop")
         
         return True
@@ -3863,6 +3866,30 @@ class GatewayRunner:
 
             # Check every 10 seconds for platforms that need reconnection
             for _ in range(10):
+                if not self._running:
+                    return
+                await asyncio.sleep(1)
+
+    async def _transport_health_watcher(self, interval: int = 60) -> None:
+        """Background task that detects silently dead transport connections.
+
+        Runs every ``interval`` seconds (default 60s).  For each connected
+        Grix adapter, calls ``_detect_dead_transport()`` which checks whether
+        the underlying WS transport has died without the adapter noticing.
+        """
+        from gateway.platforms.grix import GrixAdapter
+
+        await asyncio.sleep(30)  # let adapters connect first
+        while self._running:
+            for platform, adapter in list(self.adapters.items()):
+                if not self._running:
+                    return
+                if isinstance(adapter, GrixAdapter):
+                    try:
+                        await adapter._detect_dead_transport()
+                    except Exception:
+                        logger.exception("Transport health check failed for %s", platform.value)
+            for _ in range(interval):
                 if not self._running:
                     return
                 await asyncio.sleep(1)
