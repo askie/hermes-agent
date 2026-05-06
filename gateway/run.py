@@ -1682,8 +1682,9 @@ class GatewayRunner:
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
 
-        If the error is retryable (e.g. network blip, DNS failure), queue the
-        platform for background reconnection instead of giving up permanently.
+        Always queues the platform for background reconnection, regardless of
+        whether the error is marked retryable. Non-retryable errors (auth, config)
+        may be transient on the upstream side and recover without a gateway restart.
         """
         logger.error(
             "Fatal %s adapter error (%s): %s",
@@ -1693,7 +1694,7 @@ class GatewayRunner:
         )
         self._update_platform_runtime_status(
             adapter.platform.value,
-            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+            platform_state="retrying",
             error_code=adapter.fatal_error_code,
             error_message=adapter.fatal_error_message,
         )
@@ -1706,19 +1707,18 @@ class GatewayRunner:
                 self.adapters.pop(adapter.platform, None)
                 self.delivery_router.adapters = self.adapters
 
-        # Queue retryable failures for background reconnection
-        if adapter.fatal_error_retryable:
-            platform_config = self.config.platforms.get(adapter.platform)
-            if platform_config and adapter.platform not in self._failed_platforms:
-                self._failed_platforms[adapter.platform] = {
-                    "config": platform_config,
-                    "attempts": 0,
-                    "next_retry": time.monotonic() + 5,
-                }
-                logger.info(
-                    "%s queued for background reconnection",
-                    adapter.platform.value,
-                )
+        # Always queue for background reconnection
+        platform_config = self.config.platforms.get(adapter.platform)
+        if platform_config and adapter.platform not in self._failed_platforms:
+            self._failed_platforms[adapter.platform] = {
+                "config": platform_config,
+                "attempts": 0,
+                "next_retry": time.monotonic() + 5,
+            }
+            logger.info(
+                "%s queued for background reconnection",
+                adapter.platform.value,
+            )
 
         if not self.adapters and not self._failed_platforms:
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
@@ -2974,25 +2974,20 @@ class GatewayRunner:
                     if adapter.has_fatal_error:
                         self._update_platform_runtime_status(
                             platform.value,
-                            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+                            platform_state="retrying",
                             error_code=adapter.fatal_error_code,
                             error_message=adapter.fatal_error_message,
                         )
-                        target = (
-                            startup_retryable_errors
-                            if adapter.fatal_error_retryable
-                            else startup_nonretryable_errors
-                        )
-                        target.append(
+                        startup_retryable_errors.append(
                             f"{platform.value}: {adapter.fatal_error_message}"
                         )
-                        # Queue for reconnection if the error is retryable
-                        if adapter.fatal_error_retryable:
-                            self._failed_platforms[platform] = {
-                                "config": platform_config,
-                                "attempts": 1,
-                                "next_retry": time.monotonic() + 30,
-                            }
+                        # Always queue for reconnection — even auth errors may
+                        # be transient (upstream redeployed, config restored).
+                        self._failed_platforms[platform] = {
+                            "config": platform_config,
+                            "attempts": 1,
+                            "next_retry": time.monotonic() + 30,
+                        }
                     else:
                         self._update_platform_runtime_status(
                             platform.value,
@@ -3030,27 +3025,12 @@ class GatewayRunner:
                 }
         
         if connected_count == 0:
-            if startup_nonretryable_errors:
-                reason = "; ".join(startup_nonretryable_errors)
-                logger.error("Gateway hit a non-retryable startup conflict: %s", reason)
-                try:
-                    from gateway.status import write_runtime_status
-                    write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
-                except Exception:
-                    pass
-                self._request_clean_exit(reason)
-                return True
             if enabled_platform_count > 0:
                 reason = "; ".join(startup_retryable_errors) or "all configured messaging platforms failed to connect"
-                logger.error("Gateway failed to connect any configured messaging platform: %s", reason)
-                try:
-                    from gateway.status import write_runtime_status
-                    write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
-                except Exception:
-                    pass
-                return False
-            logger.warning("No messaging platforms enabled.")
-            logger.info("Gateway will continue running for cron job execution.")
+                logger.warning("No platforms connected at startup, %d queued for reconnection: %s", len(self._failed_platforms), reason)
+            else:
+                logger.warning("No messaging platforms enabled.")
+                logger.info("Gateway will continue running for cron job execution.")
         
         # Update delivery router with adapters
         self.delivery_router.adapters = self.adapters
@@ -3776,11 +3756,11 @@ class GatewayRunner:
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.
 
-        Uses exponential backoff: 30s → 60s → 120s → 240s → 300s (cap).
-        Stops retrying a platform after 20 failed attempts or if the error
-        is non-retryable (e.g. bad auth token).
+        Uses exponential backoff: 5s → 10s → 20s → 40s → 80s → 160s → 300s (cap).
+        Retries indefinitely — never gives up. Even non-retryable errors (auth,
+        config) are retried because the upstream may recover without a gateway
+        restart.
         """
-        _MAX_ATTEMPTS = 20
         _BACKOFF_CAP = 300  # 5 minutes max between retries
 
         await asyncio.sleep(10)  # initial delay — let startup finish
@@ -3801,29 +3781,23 @@ class GatewayRunner:
                 if now < info["next_retry"]:
                     continue  # not time yet
 
-                if info["attempts"] >= _MAX_ATTEMPTS:
-                    logger.warning(
-                        "Giving up reconnecting %s after %d attempts",
-                        platform.value, info["attempts"],
-                    )
-                    del self._failed_platforms[platform]
-                    continue
-
                 platform_config = info["config"]
                 attempt = info["attempts"] + 1
                 logger.info(
-                    "Reconnecting %s (attempt %d/%d)...",
-                    platform.value, attempt, _MAX_ATTEMPTS,
+                    "Reconnecting %s (attempt %d)...",
+                    platform.value, attempt,
                 )
 
                 try:
                     adapter = self._create_adapter(platform, platform_config)
                     if not adapter:
                         logger.warning(
-                            "Reconnect %s: adapter creation returned None, removing from retry queue",
+                            "Reconnect %s: adapter creation returned None, retrying later",
                             platform.value,
                         )
-                        del self._failed_platforms[platform]
+                        backoff = min(5 * (2 ** min(attempt - 1, 6)), _BACKOFF_CAP)
+                        info["attempts"] = attempt
+                        info["next_retry"] = time.monotonic() + backoff
                         continue
 
                     adapter.set_message_handler(self._handle_message)
@@ -3852,47 +3826,36 @@ class GatewayRunner:
                         except Exception:
                             pass
                     else:
-                        # Check if the failure is non-retryable
-                        if adapter.has_fatal_error and not adapter.fatal_error_retryable:
-                            await self._safe_adapter_disconnect(adapter, platform)
-                            self._update_platform_runtime_status(
-                                platform.value,
-                                platform_state="fatal",
-                                error_code=adapter.fatal_error_code,
-                                error_message=adapter.fatal_error_message,
-                            )
-                            logger.warning(
-                                "Reconnect %s: non-retryable error (%s), removing from retry queue",
-                                platform.value, adapter.fatal_error_message,
-                            )
-                            del self._failed_platforms[platform]
-                        else:
-                            await self._safe_adapter_disconnect(adapter, platform)
-                            self._update_platform_runtime_status(
-                                platform.value,
-                                platform_state="retrying",
-                                error_code=adapter.fatal_error_code,
-                                error_message=adapter.fatal_error_message or "failed to reconnect",
-                            )
-                            backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
-                            info["attempts"] = attempt
-                            info["next_retry"] = time.monotonic() + backoff
-                            logger.info(
-                                "Reconnect %s failed, next retry in %ds",
-                                platform.value, backoff,
-                            )
+                        # Always retry — even non-retryable errors may be
+                        # transient (e.g. upstream redeployed, auth restored).
+                        await self._safe_adapter_disconnect(adapter, platform)
+                        backoff = min(5 * (2 ** min(attempt - 1, 6)), _BACKOFF_CAP)
+                        info["attempts"] = attempt
+                        info["next_retry"] = time.monotonic() + backoff
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="retrying",
+                            error_code=adapter.fatal_error_code if adapter.has_fatal_error else None,
+                            error_message=adapter.fatal_error_message if adapter.has_fatal_error else "failed to reconnect",
+                        )
+                        logger.info(
+                            "Reconnect %s failed (%s), next retry in %ds",
+                            platform.value,
+                            adapter.fatal_error_message or "unknown",
+                            backoff,
+                        )
                 except Exception as e:
                     if adapter:
                         await self._safe_adapter_disconnect(adapter, platform)
+                    backoff = min(5 * (2 ** min(attempt - 1, 6)), _BACKOFF_CAP)
+                    info["attempts"] = attempt
+                    info["next_retry"] = time.monotonic() + backoff
                     self._update_platform_runtime_status(
                         platform.value,
                         platform_state="retrying",
                         error_code=None,
                         error_message=str(e),
                     )
-                    backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
-                    info["attempts"] = attempt
-                    info["next_retry"] = time.monotonic() + backoff
                     logger.warning(
                         "Reconnect %s error: %s, next retry in %ds",
                         platform.value, e, backoff,
