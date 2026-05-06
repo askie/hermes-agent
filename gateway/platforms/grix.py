@@ -24,6 +24,7 @@ from gateway.platforms.aibot_contract import (
     ERR_STOP_HANDLER_FAILED,
     ERR_UNSUPPORTED_DECISION,
     ERR_UNSUPPORTED_LOCAL_ACTION,
+    LOCAL_ACTION_CREATE_FOLDER,
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
     LOCAL_ACTION_FILE_LIST,
@@ -978,6 +979,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_file_list(action)
             return
 
+        if action.action_type == LOCAL_ACTION_CREATE_FOLDER:
+            await self._handle_create_folder(action)
+            return
+
         if action.action_type not in {LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT}:
             await self._client.send_local_action_result(
                 action_id=action.action_id,
@@ -1037,6 +1042,24 @@ class GrixAdapter(BasePlatformAdapter):
         if not self._client:
             return
         result = handle_file_list_action(
+            action.params,
+            resolve_cwd=lambda _sid: None,
+            fallback_dir=real_home_dir(),
+        )
+        await self._client.send_local_action_result(
+            action_id=action.action_id,
+            status=result["status"],
+            result=result.get("result"),
+            error_code=result.get("error_code"),
+            error_message=result.get("error_msg"),
+        )
+
+    async def _handle_create_folder(self, action: GrixLocalAction) -> None:
+        from gateway.platforms.grix_create_folder import handle_create_folder_action, real_home_dir
+
+        if not self._client:
+            return
+        result = handle_create_folder_action(
             action.params,
             resolve_cwd=lambda _sid: None,
             fallback_dir=real_home_dir(),

@@ -154,7 +154,8 @@
   "local_actions": [
     "exec_approve",
     "exec_reject",
-    "file_list"
+    "file_list",
+    "create_folder"
   ],
   "statuses": {
     "event_result": [
